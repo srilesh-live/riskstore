@@ -1,128 +1,309 @@
 # Riskstore Performance & Stress Test Harness — Specification and Build Plan
 
+> **Revision note (2026-09-16).** Rewritten against the real architecture. The previous revision
+> modelled L0→L1 as a database-side transform, assumed four value streams, assumed a business-date
+> partition key, and used a placeholder 120,000 rows/s. All four were wrong and each one moved
+> conclusions. Figures marked `UNVERIFIED:` are waiting on the measurement queries in
+> "Open items"; run those before quoting any number here in a go-live pack.
+
 ## Context
 
-The Riskstore is a new on-prem ClickHouse 26.1 deployment (1 shard × 2 replicas, 3 Keeper nodes, RHEL 8, 32C/64vCPU, 500 GB RAM, 6 TB disk per replica) holding risk, valuations and PnL explains for four value streams (Rates, Credit, FX, Market Treasury). Data flows L0 (raw Kafka/JSON) → L1 (flattened columnar) → L2 (report-shaped), driven by `ingestion-service` and `risk-report-service`.
+The Riskstore is a new on-prem ClickHouse 26.1 deployment (1 shard × 2 replicas, 3 Keeper nodes,
+RHEL 8, 32C/64vCPU, 500 GB RAM, 6 TB disk per replica) holding risk, valuations and PnL explains
+for **five value streams** — Rates, Credit, FX Cash, FX Commodities, FX Options.
 
-Before go-live we need defensible answers to: *what load can this cluster actually take, where does it break first, how does it behave when it breaks, and does it stay correct while breaking.* Today there is no repeatable way to answer any of that, and no baseline against which to detect regressions as schemas and query patterns evolve.
+### How data actually flows
 
-This plan delivers **`riskstore-perfbench`** — a standalone Java 21 + Muserver service, run on demand, that drives ClickHouse directly (bypassing the application services), measures it across every failure dimension that matters, and emits both an executive summary scorecard and a full detailed benchmark report.
+**L0 and L1 are written together, by the application.** `riskstore-ingestion-service` consumes an
+upstream message, applies the transforms defined in the `riskstore-data-lineage` repo **in
+process**, and writes both the raw L0 row and the derived L1 rows. It never reads the L0 table to
+produce L1. The fan-out is therefore computed client-side and arrives at ClickHouse as ordinary
+inserts.
 
-**Decisions taken (confirmed with the user):**
+Current understanding is that this is **two separate inserts**, not one atomic operation
+(`UNVERIFIED:` confirm the mechanism — it determines whether a window exists where L0 is
+committed without its L1 rows, and what the retry path must re-derive).
+
+**L2 is built on a Kafka trigger.** Once every message for a job has landed in L0 and L1, a
+notification is published to a Kafka topic with a specific header. `riskstore-report-service`
+subscribes, reads the relevant L1 meta and data tables, and writes the enriched L2 tables that
+downstream reporting consumes. This is the **only database-side transform in the system**.
+
+### Jobs
+
+Jobs are segregated by value stream — Rates trade extraction, pricing, hedging and reference-data
+jobs all run separately from Credit's, and so on for each stream. Each job covers **one site**.
+
+- Roughly **1,000 jobs per value stream per business date** → ~5,000 jobs/day.
+- Job types per stream: trade extraction, reference data extraction, market data extraction, and
+  pricing (valuations, sensitivities, PnL explains).
+- A typical ingestion job writes **4 tables, occasionally 5**: `l0_meta` (2 rows), the L0 payload
+  table, `l1_meta` (2 rows), the flattened L1 table, and sometimes a second L1 table.
+- `UNVERIFIED:` messages per job. Query 3 in "Open items" measures it.
+
+### Partitioning
+
+**Every L0, L1 and L2 table is partitioned by `(cob_date, site)`.**
+
+- `cob_date` — business date. Rarely more than 2 in flight outside stress testing.
+- `site` — ~30 locations globally (LOH, NYK, MUM, HKG, PAR, SGP, SHH, …). BAU has ≤10 active at
+  once, and sites **follow the sun**, so writes to different sites are largely sequential rather
+  than concurrent.
+
+Because jobs are single-site, **one insert touches exactly one partition**. That is the benign
+case, and it removes the partition fan-out risk that a date-only or multi-site job model would
+carry.
+
+Partitions per table:
+
+| Retention | Business dates | × 30 sites |
+|---|--:|--:|
+| 10 days (stated minimum) | 10 | 300 |
+| 1 month (recommended) | ~22 | **660** |
+| 3 months (current TTL) | ~65 | 1,950 |
+
+### Table inventory
+
+~60 tables carry `(cob_date, site)`:
+
+| Layer | Count | Notes |
+|---|--:|---|
+| L0 | 25 | per-stream payload tables (`atlas`, `trade`, `portfolio`, `vault`, `quant_json`, `scenario_var_json`, `market_data`) plus `l0_meta` |
+| L1 | 22 | per-stream `trade`, `portfolio`, `valuation`, `sensitivity`, `fxrates`, plus `l1_meta` |
+| L2 | 13 | report-shaped, plus `l2_meta` |
+| Other | 3 | `event_record`, `publish_meta`, `schema_migrations` |
+
+**Value stream is not a column in the data tables** — it is encoded in the table name
+(`l1_rates_sensitivity`, `l0_fx_options_vault`). It *is* a column in the meta tables
+(`l0_meta`, `l1_meta`, `l2_meta`), which also carry the upstream job instructions, downstream
+requirements, and job execution statistics. Any query that needs to filter by value stream without
+knowing the table name has to go through meta.
+
+`UNVERIFIED:` L2 coverage is uneven — `fx_commodities` has 5 tables and `rates` has 3, while
+`fx_cash` and `fx_options` have none. The estimate of "~10 L2 tables written per upstream job"
+cannot hold against 12 L2 data tables in total, so either one job writes most of the L2 estate or
+L2 build-out is still partial. This materially changes L2 write load.
+
+`UNVERIFIED:` `l2_loh_rates_mtmoverride` carries a site in its table name. If some L2 tables are
+genuinely per-site, the table count grows as sites onboard.
+
+### Deduplication and replay
+
+Every L0 `JSONEachRow` insert carries an `insert_deduplication_token`, so a batch retried after a
+transport failure is collapsed server-side rather than written twice. The design has four layers:
+
+1. **Bulk data rows** get a fresh **UUIDv7 token per call** — this deduplicates retries *within*
+   one call and nothing else.
+2. **Terminal "FINISHED" meta rows** get a **deterministic token** derived from the business key
+   plus replay version, so the same logical row is idempotent across calls and processes.
+3. A **read-before-write** query skips the insert when the meta row already exists.
+4. A **replay-version allocator** gives each replay run its own version, so replayed rows never
+   collide with the originals.
+
+The consequence worth holding onto: **replays are versioned, not deduplicated**. A replayed job
+writes a genuinely new set of rows under a new replay version. See D11 and D18 for what that
+implies for L2 correctness.
+
+### Volumes
+
+Per value stream per business date (`UNVERIFIED:` bytes/row are placeholders — Query 1 measures
+them):
+
+| Table class | Rows/VS/date | Bytes/row (assumed) | Per date |
+|---|--:|--:|--:|
+| L1 sensitivity (largest) | 200M | 25 | 5.0 GB |
+| L2 valuation | 20M | 60 | 1.2 GB |
+| L1 trade | 2M | 150 | 0.3 GB |
+| L0 data tables (~5 per stream) | 2M each | 150 | ~1.5 GB |
+| Meta tables | ~2,000 (2 rows/job) | — | negligible |
+
+**Derived, not measured:** ~11 GB per value stream per business date, **~55 GB/date** across five
+streams, **~1.16B rows/date**. At a flat 24-hour spread that is ~13,400 rows/s; concentrating 80%
+of it into 8 hours of regional EOD windows gives ~32,000 rows/s, with bursts plausibly reaching
+**~65,000 rows/s**. The previous revision's 120,000 rows/s appears to have been roughly 2× too
+high. `UNVERIFIED:` peak-to-average ratio.
+
+### Why this harness exists
+
+Before go-live we need defensible answers to: *what load can this cluster actually take, where does
+it break first, how does it behave when it breaks, and does it stay correct while breaking.* Today
+there is no repeatable way to answer any of that, and no baseline against which to detect
+regressions as schemas and query patterns evolve.
+
+**Decisions taken:**
 - Stack: **Java 21 + Muserver** (no Spring), fat JAR.
-- Test surface: **ClickHouse only** — the harness issues the SQL the services would issue; it does not go through Kafka or the services.
-- Chaos/failover: **in scope, operator-triggered** — the harness defines, marks and measures faults; a human injects them. No root/SSH from the harness.
-- Deliverable: **spec + working scaffolding** — buildable skeleton with one insert and one query scenario running end-to-end.
+- Test surface: **ClickHouse only** — the harness issues the SQL the services would issue. It does
+  not go through Kafka or the services, which means the in-process L0→L1 transform cost is
+  deliberately outside what it measures. See D8.
+- Chaos/failover: **in scope, operator-triggered** — the harness defines, marks and measures
+  faults; a human injects them. No root/SSH from the harness.
+- Deliverable: **spec + working scaffolding**. Build-out is deferred until the planning assumptions
+  and stress scenarios below are locked.
 
 ---
 
-## Part 1 — Answering "what am I missing besides insert and query?"
+## Part 1 — The dimensions that matter
 
-Insert and query are two of roughly a dozen dimensions. The ones that actually take ClickHouse clusters down in production are mostly *not* those two. Ranked by risk to this specific topology:
+Insert (D1) and query (D2) are two of roughly a dozen dimensions, and the ones that actually take
+ClickHouse clusters down are mostly not those two. Ranked by risk to this specific topology:
 
 | # | Dimension | Why it matters **here** | Primary signal |
 |---|---|---|---|
-| **D3** | **Merge & part lifecycle** | The #1 ClickHouse failure mode. 4 value streams × L0/L1/L2 × business-date partitions × small frequent batches = part explosion. Once merges fall behind inserts you hit `parts_to_delay_insert` (150) then `parts_to_throw_insert` (300) and ingestion stops. Insert benchmarks that run 10 minutes never surface this. | `asynchronous_metrics.MaxPartCountForPartition`, `system.merges` backlog, `ProfileEvents.DelayedInserts`/`RejectedInserts` |
-| **D4** | **Replication & Keeper** | With only **3 Keeper nodes**, Keeper is the hard write ceiling — every insert block creates znodes. Keeper saturates long before CPU does. Also: **2 replicas means `insert_quorum=2` turns any single replica outage into a total write outage** — a design decision that must be tested, not assumed. | `system.zookeeper_info` (new in 26.1), `system.replicas.absolute_delay`/`queue_size`, `ZooKeeperWaitMicroseconds` |
-| **D5** | **Mixed-workload concurrency & isolation** | Nothing runs alone. Rates ingest, Credit L2 report generation and ad-hoc queries collide. A p99 measured on an idle box is fiction. 26.1's `CREATE WORKLOAD` / `CREATE RESOURCE` is the control you'd reach for — test with and without it. | Per-stream latency delta under cross-load |
-| **D6** | **Memory pressure & spill** | L1→L2 enrichment means joins, and joins are where ClickHouse OOMs. 500 GB looks generous until a grace-hash join on a full book fans out. | `MemoryTracking`, `peak_memory_usage`, MEMORY_LIMIT_EXCEEDED rate |
-| **D7** | **Storage capacity, growth & IO** | **6 TB is the binding constraint.** 2 replicas of 1 shard = each node holds 100% of the data, and merges need free space ≥ the size of the parts being merged. Realistic usable ceiling is ~3–3.5 TB. You need measured bytes/row and compression ratio per table to know your true retention window. | Compression ratio, bytes/row, `DiskAvailable`, IO wait |
-| **D8** | **Transform pipeline throughput** | L0→L1 and L1→L2 are read+write workloads with their own profile, plus any materialized-view cascade cost charged to the insert path. Freshness SLO (ingest → L2 readable) is a pipeline property, not an insert property. | End-to-end freshness latency |
-| **D9** | **Resilience / chaos** | Replica loss, Keeper quorum loss (1 of 3 = degraded, 2 of 3 = **read-only**), disk full, restart with a large part count. Recovery time and catch-up rate are SLOs too. | Time-to-detect, time-to-recover, catch-up rate |
-| **D10** | **Endurance / soak** | 24 h–7 d. Memory creep, unbounded part drift, system-log table growth, slow degradation. A 30-minute test cannot see any of it. | Trend slopes over the run |
-| **D11** | **Correctness under stress** | A benchmark that silently loses or duplicates rows is a failed test that reports success. Reconcile rows in vs out, verify dedup on retry, and checksum both replicas for convergence. | Reconciliation checks |
-| **D12** | **Breaking-point / capacity discovery** | "Does it pass at expected load?" is the wrong question. Ramp until SLO breach to find the knee and derive a headroom factor. | Rate at first SLO breach |
-| **D13** | **Maintenance ops under load** | `ALTER ADD COLUMN`, mutations, lightweight deletes, `OPTIMIZE FINAL`, partition drops, TTL evictions — all while ingest runs. Mutations rewrite parts and compete with merges. | Mutation duration, impact on ingest |
-| **D14** | **Backup / restore** | BACKUP's IO impact on the live workload, and RESTORE duration → your actual RTO. | Backup window degradation, restore wall-clock |
-| **D15** | **Cold-start & cache effects** | Mark cache, uncompressed cache, OS page cache and query cache make the same query differ by 10–50×. If this isn't controlled, every number you publish is noise. | Cold vs warm, explicitly separated |
-| **D16** | **Client & connection layer** | Connection pool exhaustion, `max_concurrent_queries` rejection behaviour, retry storms amplifying an incident. | Rejection rate, connection counts |
-| **D17** | **Observability self-overhead** | `query_log`/`part_log`/`trace_log`/`metric_log` are real MergeTree tables with real write amplification and real disk cost at high QPS. | Bytes/day into `system.*_log` |
+| **D3** | **Merge & part lifecycle** | Single-site jobs mean one partition per insert, which is benign. The residual risk is *aggregate* parts per table across ~660 partitions, which no per-partition metric can see. | `system.parts` total per table, `MaxPartCountForPartition`, `system.merges` backlog |
+| **D4** | **Keeper memory, not Keeper throughput** | At derived insert rates Keeper is nowhere near its write ceiling. The real exposure is **znode count** — partitions × parts × replicas × ~60 tables. | `system.zookeeper_info.znode_count`, `approximate_data_size` |
+| **D7** | **Storage capacity & TTL** | 3-month TTL does not fit in 6 TB at these volumes, and merges fail before writes do. | Measured bytes/row, `DiskAvailable` |
+| **D18** | **Job completion & trigger semantics** | The Kafka trigger is the sole gate on L2. At-least-once delivery plus versioned replays is a double-count risk that reports as success. | Trigger→L2 latency, L2 row counts under redelivery |
+| **D11** | **Correctness under stress** | Replay versioning means correctness is a *job-level* property, not a row-count property. | Job-level reconciliation, replica convergence |
+| **D5** | **Mixed-workload concurrency** | Five streams run concurrently, staggered by site. L2 builds are the query-side load colliding with ingest. | Per-stream latency delta under cross-load |
+| **D6** | **Memory pressure & spill** | L2 build joins across several L1 tables within a value stream. | `peak_memory_usage`, MEMORY_LIMIT_EXCEEDED rate |
+| **D8** | **L1→L2 pipeline throughput** | The only database-side transform. Freshness is bounded by job completion, not transform cadence. | End-to-end freshness latency |
+| **D9** | **Resilience / chaos** | Two replicas and three Keeper nodes give two single-failure cliffs. | Time-to-detect, time-to-recover, catch-up rate |
+| **D10** | **Endurance / soak** | Part and znode accumulation across ~660 partitions × 60 tables is a slow slope. | Trend slopes over the run |
+| **D12** | **Breaking-point discovery** | Ramp to SLO breach to derive a headroom factor. | Rate at first SLO breach |
+| **D13** | **Maintenance ops under load** | `DROP PARTITION` per site is now nearly free — that is a direct benefit of the partition key. Mutations are not. | Mutation duration, impact on ingest |
+| **D14** | **Backup / restore** | RTO is a measured number and it is probably larger than assumed. | Backup window degradation, restore wall-clock |
+| **D15** | **Cold-start & cache effects** | At 1-month retention a large fraction of the dataset fits in page cache, so cold/warm differences are extreme. | Cold vs warm, explicitly separated |
+| **D16** | **Client & connection layer** | Retry storms amplifying an incident; queueing invisible to ClickHouse. | Rejection rate, connection counts |
+| **D17** | **Observability self-overhead** | System log tables are real MergeTree tables with real cost. | Bytes/day into `system.*_log` |
 
-**The short version:** the three you most need and are most likely to skip are **D3 (parts/merges)**, **D4 (Keeper ceiling)** and **D11 (correctness under stress)**. D10 (soak) is the one that finds what all the others miss.
+**The short version:** the risks that moved *up* on the real architecture are **D7 (TTL does not
+fit)**, **D4 (znode count, not throughput)** and **D18 (trigger semantics)**. The ones that moved
+*down* are D3 and D4-as-throughput — single-site jobs and modest insert rates make both far less
+threatening than the previous revision assumed.
 
 ---
 
 ### Working baseline for the examples below
 
-Every worked example in this section uses one consistent set of volume assumptions. **These are placeholders** — replace them with your measured figures and the arithmetic will re-run. They are stated explicitly so you can see which conclusions are sensitive to which input.
+Every worked example uses one consistent set of assumptions. Sources are marked so you can see
+which conclusions rest on measurement and which on estimate.
 
-| Assumption | Value |
-|---|---|
-| Rates trades revalued per EOD snap | 2,000,000 |
-| Measure/scenario combinations per trade | ~100 → **200M L0 pricing rows per business date** |
-| Nested delta ladder per L0 row | 14 tenor points |
-| L0 Atlas row, uncompressed JSON | ~1.5 KB |
-| L0 Atlas row, compressed on disk | ~150 bytes |
-| L1 sensitivity row, compressed on disk | ~25 bytes |
-| EOD delivery window | ~2 hours, bursting 3–4× |
-| Aggregate peak across four streams | **~120,000 rows/s** |
-| `ingestion-service` batch size | 20,000 rows per INSERT |
-| Retention (assumed) | 90 business dates |
+| Assumption | Value | Source |
+|---|--:|---|
+| Value streams | 5 | Confirmed |
+| Sites | ~30, ≤10 active, follow-the-sun | Confirmed |
+| Jobs per value stream per date | ~1,000 | Confirmed (approximate) |
+| Tables written per ingestion job | 4, sometimes 5 | Confirmed |
+| Partition key | `(cob_date, site)` | Confirmed |
+| Partitioned tables | ~60 | Counted from inventory |
+| L1 sensitivity rows/VS/date | 200M | Confirmed (approximate) |
+| Total rows/date, all layers | ~1.16B | Derived |
+| Peak ingest | ~65,000 rows/s | Derived — `UNVERIFIED:` peak factor |
+| Batch size | 20,000 rows | `UNVERIFIED:` confirm against ingestion-service |
+| Bytes/row | 25–150 by table class | `UNVERIFIED:` Query 1 |
+| L1 sensitivity fan-out | 2–1000 per source row | Range confirmed, distribution `UNVERIFIED:` Query 2 |
+| Retention | 3 months now, 1 month recommended | Decision pending |
 
 Two derived numbers used repeatedly:
 
-- 120,000 rows/s ÷ 20,000 rows per batch = **6 INSERTs/s**
-- 120,000 rows/s × 150 bytes = **~18 MB/s** landing on disk before merge amplification
+- 1.16B rows/date ÷ 20,000 rows per batch ≈ **58,000 inserts/date ≈ 0.67 inserts/s average**
+- ~55 GB/date on disk before merge amplification
 
 ---
 
 ### D3 — Merge and part lifecycle
 
-**Mechanism.** Every INSERT creates at least one new data part *per partition it touches*. Parts are immutable; a background pool merges them into progressively larger parts. MergeTree defends itself with three hard limits: at **`parts_to_delay_insert` = 150** active parts in a single partition it starts injecting artificial sleep into INSERTs; at **`parts_to_throw_insert` = 300** it rejects them outright with `TOO_MANY_PARTS`; and **`max_parts_in_total` = 100,000** across all partitions of a table is a backstop.
+**Mechanism.** Every INSERT creates at least one new data part *per partition it touches*. Parts
+are immutable; a background pool merges them into progressively larger parts. MergeTree defends
+itself with three limits: **`parts_to_delay_insert` = 150** active parts in a single partition
+starts injecting sleep into INSERTs; **`parts_to_throw_insert` = 300** rejects them with
+`TOO_MANY_PARTS`; and **`max_parts_in_total` = 100,000** across all partitions of a table.
 
-**Why it bites this cluster.** You have four value streams × three layers × a partition per business date. Nothing about that is unusual — what makes it dangerous is that ingestion does not degrade gracefully when merges fall behind. It runs fine, then it runs fine, then it stops.
+**Why the shape of the risk changed.** The first two limits are *per-partition* counters, blind to
+a table that is wide rather than deep. With `(cob_date, site)` you have ~660 partitions per table
+at 1-month retention, so the table-wide limit is the one that can bind while every per-partition
+metric looks healthy.
 
-**Worked example — the steady case.** At 6 INSERTs/s into a single business-date partition you create 6 parts/s. Merges must retire 6 parts/s to hold level. Merge write amplification is typically 3–6× (each row is rewritten once per level of the merge tree), so at 18 MB/s of ingest the background pool is moving roughly **90 MB/s of writes and ~180 MB/s of combined device IO** just to stand still. On NVMe that is nothing. On a shared SAN with other tenants it may well be your actual ceiling — which is why the disk *type* matters more than the disk *size* here.
+**But it does not bind at realistic part counts.** Parts do not distribute uniformly. A partition
+accumulates parts only while it is being written; once a `(cob_date, site)` closes, merges compact
+it toward a handful of large parts. The realistic shape is a few hot partitions at 50–150 parts and
+everything else settled at 1–5:
 
-**Worked example — the blowup.** Now a replay or a late-arriving feed puts five business dates in one batch. ClickHouse cannot merge across partitions, so that single INSERT creates **five** parts instead of one:
+| Retention | Partitions | Settled at 3 parts | Degraded at 20 parts |
+|---|--:|--:|--:|
+| 1 month | 660 | ~2,000 | 13,200 |
+| 3 months | 1,950 | ~5,900 | 39,000 |
 
-- 6 INSERTs/s × 5 partitions = **30 parts/s created**
-- Each partition now merges independently, with fewer parts each, so merges are *less* efficient per unit of IO
-- Net accumulation goes positive
+Both columns clear 100,000. **The conditional is the finding:** if the merge pool is starved and
+closed partitions settle at 20+ parts rather than 3, you are on the right-hand column and climbing,
+and `MaxPartCountForPartition` still reads a reassuring 50.
 
-**The number that actually matters is the net accumulation rate**, because it sets your time-to-failure — and therefore which test can possibly catch it:
+**Worked example — the benign steady case.** At ~0.67 inserts/s across the estate, each touching
+one partition, the cluster creates well under 1 part/s. Merge write amplification of 3–6× against
+~55 GB/date of ingest is roughly 2–4 MB/s of sustained merge IO. That is negligible on any
+reasonable device. **Merge throughput is not the constraint at current volumes.**
 
-| Net part accumulation | Time to hit 300 (throw) | Which test catches it |
+**Worked example — where it does bite: multi-date stress.** ClickHouse cannot merge across
+partitions. A replay or a stress run spanning 5 business dates × 10 sites turns one logical batch
+into **50 partitions**, so a single insert operation creates 50 parts instead of 1, and each
+partition then merges independently and less efficiently. This is exactly the scenario the harness
+must generate deliberately, because BAU will never produce it and a schema or replay change might.
+
+**The number that matters is net accumulation rate**, because it sets time-to-failure and therefore
+which test can catch it:
+
+| Net part accumulation | Time to hit 300 in a partition | Which test catches it |
 |---|---|---|
 | +1.0 part/s | 5 minutes | Any test |
 | +0.05 part/s | ~100 minutes | `mixed-eod-peak`, not a 30-min run |
 | +0.01 part/s | ~8.3 hours | **Only `soak-24h`** |
 
-That bottom row is the whole argument for endurance testing. A cluster losing one part every hundred seconds passes every short benchmark you run and stops ingesting overnight.
+**What failure looks like.** `DB::Exception: Too many parts (300)` (code 252) for the per-partition
+case. For the table-wide case, a different message naming `max_parts_in_total` — and no prior
+warning from the per-partition metric.
 
-**What failure looks like.** `DB::Exception: Too many parts (300). Merges are processing significantly slower than inserts` (code 252). Before that, silent slowdown as `DelayedInserts` climbs and INSERT latency creeps up for no visible reason.
+**Measure.** Both scopes, which the previous revision got wrong by tracking only the first:
+`asynchronous_metrics.MaxPartCountForPartition`, **plus total active parts per table from
+`system.parts`**, `system.merges` backlog, `ProfileEvents.DelayedInserts` / `RejectedInserts`, and
+`system.parts.files` (new in 26.1).
 
-**Measure.** `asynchronous_metrics.MaxPartCountForPartition` (the single most important number in the harness), `system.merges` backlog and `MergeMaxElapsedSec`, `ProfileEvents.DelayedInserts` / `RejectedInserts`, and `system.parts.files` (new in 26.1 — rising files-per-part means wide/sparse schemas driving merge cost).
+**Read the slope, not the value.** A part count flat at 40 then rising at 0.01/s is a failed run
+even though it never approaches 150.
 
-**Read the slope, not the value.** A part count flat at 40 for twenty minutes then rising at 0.01/s is a failed run even though it never came near 150.
-
-**Covered by.** `insert-baseline-rates`, `soak-24h`, `breaking-point`.
+**Covered by.** `insert-baseline-{stream}`, `soak-24h`, `breaking-point`, and a new
+`multi-date-replay` scenario.
 
 ---
 
-### D4 — Replication and Keeper
+### D4 — Keeper: memory is the risk, throughput is not
 
-**Mechanism.** Every INSERT into a `ReplicatedMergeTree` is a distributed transaction against Keeper. Roughly: check-and-create a block-hash znode under `/blocks/` for deduplication, create a part znode under `/replicas/<replica>/parts/`, append an entry to `/log/`, and update replica pointers. The other replica watches `/log/`, fetches the part, and writes its own znodes. Call it **4–8 Keeper writes per INSERT block**, each requiring Raft quorum (2 of 3) plus fsync.
+**Mechanism.** Every INSERT into a `ReplicatedMergeTree` is a distributed transaction against
+Keeper: check-and-create a block-hash znode under `/blocks/`, create a part znode under
+`/replicas/<replica>/parts/`, append to `/log/`, update replica pointers. Roughly **4–8 Keeper
+writes per INSERT block**, each requiring Raft quorum (2 of 3) plus fsync.
 
-**Why it bites this cluster.** Three Keeper nodes tolerate exactly one failure. And because Keeper cost scales with the number of *blocks*, not the number of *rows*, your batch size is the dominant lever — which is a property of the ingestion service, not of ClickHouse.
+**Throughput is comfortable.** At ~0.67 inserts/s average and perhaps 6–7/s at peak, that is
+**~50 Keeper writes/s at peak**. Keeper handles that without noticing. The previous revision framed
+Keeper as the hard write ceiling; at these volumes it is not.
 
-**Worked example — batch size is the Keeper lever.**
+**The batch-size lever still matters, as a tripwire rather than a present danger.** Keeper cost
+scales with the number of *blocks*, not rows — a property of the ingestion service, not ClickHouse:
 
-| Batch size | INSERTs/s at 120k rows/s | Keeper writes/s (~8 per insert) | Verdict |
-|---|---|---|---|
-| 20,000 rows | 6 | ~50 | Trivial |
-| 2,000 rows | 60 | ~500 | Comfortable |
-| 200 rows | 600 | ~5,000 | **Keeper is now the ceiling** |
+| Batch size | Inserts/s at peak | Keeper writes/s | Verdict |
+|---|--:|--:|---|
+| 20,000 rows | ~7 | ~50 | Trivial |
+| 2,000 rows | ~70 | ~500 | Comfortable |
+| 200 rows | ~700 | ~5,000 | Keeper becomes the ceiling |
 
-Same row throughput, 100× the Keeper load. If the ingestion service ever "optimises" for latency by shrinking batches, this is where it lands — and the symptom will look like a ClickHouse problem.
+If the ingestion service ever "optimises" for latency by shrinking batches, this is where it lands,
+and the symptom will look like a ClickHouse problem.
 
-**Worked example — znode inventory.** Block hashes are retained per `replicated_deduplication_window` = **100 blocks per partition** and `replicated_deduplication_window_seconds` = **604,800 (7 days)**, whichever is tighter. With 4 streams × ~5 tables × 90 retained partitions = 1,800 partitions:
+**Memory is the real exposure.** Keeper holds every znode in memory, and znode count scales with
+partitions × parts × replicas × tables — all four of which this architecture multiplies:
 
-- block znodes: 1,800 × 100 ≈ **180,000**
-- part znodes: 1,800 × ~50 active parts × 2 replicas ≈ **180,000**
-- order of magnitude: **~400,000 znodes**, roughly 100–400 MB of Keeper heap
+| Component | Formula | 1 month | 3 months |
+|---|---|--:|--:|
+| Part znodes | partitions × parts × 2 replicas × 60 tables | ~240,000 | ~700,000 |
+| Block znodes (7-day window) | 7 dates × 30 sites × 100 × 60 tables | ≤1.26M | ≤1.26M |
+| **Degraded case** | 20 parts/partition instead of 3 | 1.6M | **4.7M** |
 
-Keeper holds every znode in memory. That is fine on a properly sized host and not fine on the 4 GB VM that Keeper nodes often get provisioned as.
+Part znodes do not expire — they exist for as long as the part is active. Block znodes are bounded
+by `replicated_deduplication_window_seconds` = 604,800 (7 days), so they reach steady state
+independently of retention.
+
+The healthy case is fine. The degraded case — poor merge health at 3-month retention — puts
+millions of znodes on three Keeper nodes and is a go-live blocker. **This is a second, independent
+argument for the shorter TTL**, and it is why D10 tracks `znode_count` slope rather than value.
 
 **The decision this dimension forces.** With **two** replicas there is no middle setting:
 
@@ -131,32 +312,47 @@ Keeper holds every znode in memory. That is fine on a properly sized host and no
 | `0` / `1` | Ack from one replica, replicate async | Replica dies before replicating → that block is **lost** |
 | `2` | Every insert waits for both | Replica down for OS patching → **all writes stop** |
 
-There is no "quorum of 3 out of 5" compromise available to you. This is the single biggest availability decision in the architecture and it should be made from a measured run, not from a default. `chaos-replica-kill` is built to be run both ways.
+No "quorum of 3 out of 5" compromise exists here. This is the single biggest availability decision
+in the architecture and it should be made from a measured run, not a default. `chaos-replica-kill`
+is built to be run both ways.
 
-**Latency reality check.** A Keeper write is network RTT + fsync on two nodes. Expect 1–5 ms with a dedicated NVMe log device. Expect 20–100 ms if the Keeper log shares a spindle with ClickHouse data — a classic and very expensive co-location mistake.
+**Latency reality check.** A Keeper write is network RTT + fsync on two nodes. Expect 1–5 ms with a
+dedicated NVMe log device; 20–100 ms if the Keeper log shares a spindle with ClickHouse data.
 
-**Measure.** `system.zookeeper_info` (new in 26.1): `avg_latency`, `max_latency`, `outstanding_requests`, `znode_count`, `watch_count`, `approximate_data_size`, `synced_followers`, and the derived `KeeperCommitLag` (`leader_committed_log_idx − last_committed_idx`). Plus `system.replicas.absolute_delay` / `queue_size` and `ProfileEvents.ZooKeeperWaitMicroseconds`.
+**Measure.** `system.zookeeper_info` (new in 26.1): `znode_count`, `approximate_data_size`,
+`avg_latency`, `max_latency`, `outstanding_requests`, `watch_count`, `synced_followers`, and
+derived `KeeperCommitLag`. Plus `system.replicas.absolute_delay` / `queue_size` and
+`ProfileEvents.ZooKeeperWaitMicroseconds`.
 
-**Covered by.** `mixed-eod-peak`, `breaking-point`, `chaos-replica-kill`, chaos C3–C5.
+**Covered by.** `soak-24h` (znode slope is the headline), `mixed-eod-peak`, `breaking-point`,
+`chaos-replica-kill`, chaos C3–C5.
 
 ---
 
 ### D5 — Mixed-workload concurrency and isolation
 
-**Mechanism.** `max_threads` defaults to the core count, so a *single* large `GROUP BY` can claim all 64 vCPUs. Background merges draw from a separate pool (`background_pool_size`, default 16) but compete for the same CPU and the same disk.
+**Mechanism.** `max_threads` defaults to the core count, so a *single* large `GROUP BY` can claim
+all 64 vCPUs. Background merges draw from a separate pool (`background_pool_size`, default 16) but
+compete for the same CPU and the same disk.
 
-**Why it bites this cluster.** Four value streams share one cluster with no natural boundary between them. Everything that makes a p99 look good in an isolated test — an idle box, a warm cache, an uncontended merge pool — is absent at 17:00 on the last business day of the quarter.
+**Why it bites this cluster.** Five value streams share one cluster with no boundary between them,
+and they run concurrently. Site staggering helps — follow-the-sun means the *ingest* side is
+partly sequential — but it does not help the L2 side, because an L2 build for a site that just
+closed runs while the next region is already ingesting.
 
-**Worked example — the cascade.** This is the shape of most real incidents, and note that no single dimension is "the" cause:
+**Worked example — the cascade.** The shape of most real incidents, where no single dimension is
+"the" cause:
 
-1. Credit's L2 report build starts: a three-way join, 32 threads, 40 GB resident.
-2. Rates EOD ingest is at peak. Its **merges** are now starved of CPU by the Credit query.
+1. A Credit L2 build starts: joins across several L1 tables, 32 threads, tens of GB resident.
+2. FX Cash ingest for the next region is at peak. Its **merges** are now starved of CPU.
 3. Merge throughput drops below insert rate → part count climbs (**D3**).
 4. Part count crosses 150 → `DelayedInserts` → INSERT latency rises.
-5. `ingestion-service` back-pressures → Kafka consumer lag grows.
+5. `riskstore-ingestion-service` back-pressures → Kafka consumer lag grows.
 6. It gets escalated as a **Kafka** incident.
 
-A D5 cause, presenting as a D3 symptom, reported as a messaging problem. This is exactly why the harness overlays server-side internals on the same time axis as client latency — the part-count chart is what makes step 3 visible.
+A D5 cause, presenting as a D3 symptom, reported as a messaging problem. This is why the harness
+overlays server-side internals on the same time axis as client latency — the part-count chart is
+what makes step 3 visible.
 
 **The control.** ClickHouse 26.1 workload scheduling:
 
@@ -168,9 +364,13 @@ CREATE WORKLOAD reports   IN all SETTINGS max_concurrent_threads = 24, priority 
 CREATE WORKLOAD adhoc     IN all SETTINGS max_concurrent_threads = 8,  priority = 2;
 ```
 
-Queries then carry `SETTINGS workload = 'reports'`. Note that declaring a CPU resource **disables** `concurrent_threads_soft_limit_num` — the workload setting takes over.
+Queries then carry `SETTINGS workload = 'reports'`. Declaring a CPU resource **disables**
+`concurrent_threads_soft_limit_num` — the workload setting takes over.
 
-**How to measure isolation.** Run `insert-baseline-rates` alone and record p99. Run `mixed-eod-peak` and record the same workload's p99. The delta is your isolation cost. Then run it again with workloads declared. The difference between those two deltas is what workload scheduling is worth to you — and it is the only honest way to decide whether to adopt it.
+**How to measure isolation.** Run `insert-baseline-rates` alone and record p99. Run
+`mixed-eod-peak` and record the same workload's p99. The delta is your isolation cost. Then run it
+again with workloads declared. The difference between those two deltas is what workload scheduling
+is worth to you, and it is the only honest way to decide whether to adopt it.
 
 **Covered by.** `mixed-eod-peak`, run with and without workload scheduling.
 
@@ -178,19 +378,33 @@ Queries then carry `SETTINGS workload = 'reports'`. Note that declaring a CPU re
 
 ### D6 — Memory pressure and spill
 
-**Mechanism.** `max_server_memory_usage_to_ram_ratio` defaults to 0.9, so ~450 GB of your 500 GB is available to ClickHouse. A hash join builds its hash table from the **right-hand** table entirely in memory. A `GROUP BY` holds one aggregate state per group key.
+**Mechanism.** `max_server_memory_usage_to_ram_ratio` defaults to 0.9, so ~450 GB of your 500 GB is
+available. A hash join builds its hash table from the **right-hand** table entirely in memory. A
+`GROUP BY` holds one aggregate state per group key.
 
-**Why it bites this cluster.** L1→L2 enrichment is join-shaped, and joins are ClickHouse's weakest area. 500 GB sounds like plenty right up until a group-by fans out.
+**Why it bites this cluster.** The L2 build is join-shaped by construction — it reads several L1
+tables plus `l1_meta` for one value stream and writes report-shaped output. Joins are ClickHouse's
+weakest area.
 
-**Worked example — the join.** `q_trade_join_valuation` builds on `l1_rates_trade`:
+**Worked example — the L2 build join.** An L2 valuation build joining `l1_rates_valuation` against
+`l1_rates_trade` and `l1_rates_portfolio`, scoped to one `(cob_date, site)`:
 
-- One business date: 2M rows × ~150 bytes = **300 MB**. Comfortable.
-- Ninety business dates: 180M rows × 150 bytes = **27 GB** per join.
-- Five of those concurrently at quarter-end: **135 GB**. Now it is a real constraint.
+- One partition of `l1_rates_valuation`: `UNVERIFIED:` row count pending Query 1, but at
+  20M rows/VS/date ÷ 30 sites ≈ 670k rows × 60 bytes ≈ **40 MB**. Comfortable.
+- Scoped to one cob_date across all sites: 20M × 60 ≈ **1.2 GB**. Still fine.
+- The risk is an L2 build that is *not* partition-scoped — a cross-date or cross-site report —
+  which at 1-month retention reads 22× that.
 
-**Worked example — the group-by that actually hurts.** `q_book_aggregate_wide` groups by `counterparty_id` × `book_id` × `currency` = 5,000 × 240 × 12 = up to **14.4M group keys**. A plain `sum()` state is 8 bytes, so that is only ~115 MB. But add `quantile()`, whose reservoir state runs to ~1 KB per group, and the same query needs **~14 GB on its own**.
+**Partition scoping is the control.** Because every table is partitioned by `(cob_date, site)`, an
+L2 build that filters on both prunes to a single partition and stays small. One that does not
+filter reads the whole retention window. **Verifying that every L2 build is partition-scoped is a
+cheap, high-value check** and belongs in the harness.
 
-That asymmetry is the finding: the aggregate *function* matters more than the row count. A report that adds a percentile column can multiply its memory by two orders of magnitude without changing a single `WHERE` clause.
+**Worked example — the group-by that hurts.** A wide aggregate over `counterparty_id` × `book_id` ×
+`currency` can reach millions of group keys. A plain `sum()` state is 8 bytes; a `quantile()`
+reservoir runs to ~1 KB per group. The aggregate *function* matters more than the row count — a
+report that adds a percentile column can multiply its memory by two orders of magnitude without
+changing a single `WHERE` clause.
 
 **The two failure modes, and why the difference matters enormously.**
 
@@ -199,183 +413,274 @@ That asymmetry is the finding: the aggregate *function* matters more than the ro
 | `MEMORY_LIMIT_EXCEEDED` (code 241) | The query dies | One query. Graceful. |
 | Linux OOM-killer | `clickhouse-server` is killed | Replica restarts → cold caches (**D15**), part re-attach (**D3**), replication catch-up (**D4**) |
 
-The second turns a query problem into a cluster incident. **Setting `max_memory_usage` per workload is what keeps you in row one** — an unbounded per-query limit means the server-wide limit is the only thing between an ad-hoc query and an OOM kill.
+The second turns a query problem into a cluster incident. **Setting `max_memory_usage` per workload
+is what keeps you in row one.**
 
-**Spill controls to exercise.** `max_bytes_before_external_group_by` (set to roughly half of `max_memory_usage`), `max_bytes_before_external_sort`, and `join_algorithm` — compare `hash` against `grace_hash` on identical data. `grace_hash` spills to disk instead of dying; the run tells you what that safety costs in latency.
+**Spill controls to exercise.** `max_bytes_before_external_group_by` (roughly half of
+`max_memory_usage`), `max_bytes_before_external_sort`, and `join_algorithm` — compare `hash`
+against `grace_hash` on identical data.
 
-**Measure.** `peak_memory_usage` per `query_id` from `system.query_log`, `MemoryTracking`, `jemalloc.resident`, and the `MEMORY_LIMIT_EXCEEDED` count from `system.errors`.
+**Measure.** `peak_memory_usage` per `query_id` from `system.query_log`, `MemoryTracking`,
+`jemalloc.resident`, `MEMORY_LIMIT_EXCEEDED` from `system.errors`, and **partitions read per L2
+build** as a proxy for scoping discipline.
 
-**Covered by.** `mixed-eod-peak` (the `l2-report-build` workload pins `join_algorithm`), `breaking-point`.
-
----
-
-### D7 — Storage capacity, growth and IO
-
-**Mechanism.** One shard × two replicas means **each node holds 100% of the data** — replicas are copies, not slices. Separately, `max_bytes_to_merge_at_max_space_in_pool` defaults to **150 GB**, and ClickHouse refuses a merge when free space cannot accommodate it. Run the disk close to full and merges stop *before* writes do.
-
-**Why it bites this cluster.** 6 TB is the binding constraint on the entire architecture, and the usable figure is a lot less than 6 TB.
-
-**Worked example — retention, and this is the one to check first.** Using the baseline assumptions:
-
-| Table | Rows per business date | Bytes/row | Per date |
-|---|---|--:|--:|
-| `l0_rates_atlas` | 200M | 150 | 30 GB |
-| `l1_rates_valuation` | 200M | 60 | 12 GB |
-| `l1_rates_sensitivity` | 200M × 14 = **2.8B** | 25 | **70 GB** |
-| Rates subtotal | | | **~112 GB** |
-| All four streams (Rates ≈ 40%) | | | **~280 GB/date** |
-
-Against ~3.5 TB usable (6 TB less merge headroom and the free-space floor):
-
-> **3.5 TB ÷ 280 GB = roughly 12 business dates of retention.**
-
-Two and a half weeks. If your retention requirement is 90 days — or seven years for a regulatory archive — this number says the architecture needs a change *before* go-live, not after: more shards, tiered storage to object store, or aggregating at L2 and expiring L1 sensitivity aggressively.
-
-Note where the mass is: **`l1_rates_sensitivity` is 62% of the footprint**, purely because the delta ladder turns one row into fourteen. That single fan-out decision dominates your storage bill.
-
-I want to be clear that the 12-day figure rests entirely on the placeholder volumes above. It could be 40 days or it could be 4. **That is precisely why the harness measures `BytesPerRow` and `CompressionRatio` per table rather than asking you to estimate them** — swap in the measured numbers and this table becomes a real capacity plan.
-
-**Also measure IO contention.** Merges and queries share one device. Merge throughput on NVMe runs 1–2 GB/s; on SAS SSD nearer 500 MB/s; on shared SAN, whatever the neighbours leave you. The D3 arithmetic (~180 MB/s of merge IO at peak) only works if the device can deliver it *while also* serving report queries.
-
-**Measure.** `BytesPerRow` and `CompressionRatio` per table from `system.parts`, `DiskAvailableBytes`, `DiskFreeFraction`, and OS-level IO wait.
-
-**Covered by.** The `capacity-growth` scenario (T10), plus `soak-24h` for the growth slope.
+**Covered by.** `mixed-eod-peak`, `breaking-point`.
 
 ---
 
-### D8 — Transform pipeline throughput
+### D7 — Storage capacity, TTL and IO
 
-**Mechanism.** L0→L1 and L1→L2 are simultaneously read and write workloads against the same disk, competing with ingestion and with merges. The `l0_rates_atlas` → `l1_rates_sensitivity` transform does `ARRAY JOIN` over a JSON subcolumn, which is both a 14× row fan-out and a CPU-heavy parse.
+**Mechanism.** One shard × two replicas means **each node holds 100% of the data** — replicas are
+copies, not slices. `max_bytes_to_merge_at_max_space_in_pool` defaults to **150 GB**, and ClickHouse
+refuses a merge when free space cannot accommodate it. Run the disk close to full and **merges stop
+before writes do**.
 
-**Why it bites this cluster.** The transform is very likely the **largest single workload in the system** — larger than ingestion itself. 200M rows in, 2.8B rows out, per business date, per stream. It is easy to size the cluster for ingestion and then be surprised by the layer that consumes it.
+**This is the dimension that produced the clearest finding.** At ~55 GB/date derived:
 
-**Worked example — the freshness budget.** "Kafka publish → L2 readable" is a pipeline property, not an insert property. A plausible decomposition:
+| Retention | Business dates | Footprint | % of ~3.5 TB usable |
+|---|--:|--:|--:|
+| 10 days (stated minimum) | 10 | ~550 GB | 16% |
+| **1 month (recommended)** | ~22 | **~1.2 TB** | **35%** |
+| 3 months (current TTL) | ~65 | ~3.6 TB | **over ceiling** |
+
+**Three months does not fit**, and it fails in the nastier direction: you hit *merge* failure before
+*disk-full*, which presents as unexplained part-count growth rather than a clear error.
+
+**Recommendation: set TTL to 1 month.** It is 2× the stated 10-day minimum, leaves ~65% headroom
+for the merge working set and growth, and keeps partitions per table at ~660 — which is also what
+keeps D4's znode count in the healthy column. Re-run this table with measured bytes/row from
+Query 1 before committing.
+
+**Partition key: keep `(cob_date, site)`.** Three reasons, the first decisive:
+
+1. **Per-site replay is a `DROP PARTITION`** — metadata-only and instant. With `cob_date` alone,
+   correcting one site requires a mutation, which rewrites parts and competes with merges (D13).
+   Given the replay-version allocator, replay is clearly a first-class operation.
+2. **Follow-the-sun makes it the ideal write pattern** — one hot partition at a time per stream,
+   rather than 30 sites interleaving into a partition that stays open for 24 hours.
+3. **Query pruning by site**, free.
+
+The cost is 30× the partition count. At 1-month retention that is affordable; at 3 months it starts
+to matter, which is the second independent argument for the shorter TTL.
+
+**Also measure IO contention.** Merges and queries share one device. Merge throughput on NVMe runs
+1–2 GB/s; on SAS SSD nearer 500 MB/s; on shared SAN, whatever the neighbours leave you. At current
+volumes merge IO is small (2–4 MB/s), so this is a stress-scenario concern rather than a BAU one.
+
+**Measure.** `BytesPerRow` and `CompressionRatio` per table from `system.parts`,
+`DiskAvailableBytes`, `DiskFreeFraction`, OS-level IO wait, and **GB per business date** as the
+input to the retention decision.
+
+**Covered by.** `capacity-growth` (T10), plus `soak-24h` for the growth slope.
+
+---
+
+### D8 — L1→L2 pipeline throughput
+
+**Mechanism.** L1→L2 is the **only database-side transform**. It is a read+write workload against
+the same disk, competing with ingestion and with merges, triggered per job by a Kafka
+notification.
+
+**What this dimension is not.** The previous revision modelled an L0→L1 database transform doing
+`ARRAY JOIN` over a JSON subcolumn. That workload does not exist. The transform runs in
+`riskstore-ingestion-service` using `riskstore-data-lineage` definitions, and the fan-out arrives
+as ordinary inserts.
+
+**The consequence is a deliberate blind spot.** The transform CPU — including a fan-out that can
+reach 1000 rows per source row — now lives in the ingestion service, and a DB-direct harness cannot
+see it. If that computation is expensive, its cost is invisible to every number this harness
+produces. **This must be stated in the report**, and it is the strongest argument for eventually
+building the end-to-end variant of the harness.
+
+**Worked example — the freshness budget.** "Kafka publish → L2 readable" is a pipeline property:
 
 | Stage | Budget |
 |---|---|
-| Kafka → `ingestion-service` | ~100 ms |
-| L0 INSERT ack | ~500 ms |
-| L0→L1 transform trigger + run | 30–120 s |
-| L1→L2 report build (joins) | 60–300 s |
-| **End to end** | **~2–8 minutes** |
+| Kafka → `riskstore-ingestion-service` | ~100 ms |
+| In-process L0→L1 transform | `UNVERIFIED:` measured in the service, not here |
+| L0 + L1 insert ack | ~500 ms |
+| **Wait for the last message of the job** | **`UNVERIFIED:` dominant term** |
+| Trigger publish → report-service consumes | seconds |
+| L1→L2 build | `UNVERIFIED:` |
 
-If the business expects "risk is visible within a minute of pricing", the transform cadence — not ClickHouse throughput — is what makes that false. That conversation is much cheaper before go-live.
+**Freshness is bounded by job completion, not transform cadence.** A job cannot trigger L2 until
+its final message lands, so end-to-end latency is a function of job *size* and of how reliably the
+last message arrives. That reframes the SLO conversation: "risk visible within N minutes" is a
+statement about job granularity, not about ClickHouse throughput.
 
-**The design decision this dimension forces: materialized view vs scheduled `INSERT … SELECT`.**
+**The design decision that remains live — for L1→L2 only.**
 
-| | Materialized view | Scheduled `INSERT … SELECT` |
+| | Materialized view | Trigger-driven `INSERT … SELECT` (current) |
 |---|---|---|
-| When it runs | Synchronously, on the insert path | Decoupled, on a cadence |
+| When it runs | Synchronously, on the insert path | Decoupled, on job completion |
 | Cost charged to | **The INSERT** — insert p99 includes MV cost | Its own workload |
-| Freshness | Immediate | One cadence interval of lag |
-| Complexity | Low | Needs watermarking / late-data handling |
-| Failure coupling | MV error fails the INSERT | Transform can fail independently |
+| Freshness | Immediate | One job-completion interval |
+| Complexity | Low | Needs the trigger, and D18's guarantees |
+| Failure coupling | MV error fails the INSERT | Build can fail independently |
 
-**Relevant to 26.1 specifically:** async-insert deduplication now extends end-to-end to dependent materialized views. Previously a retried async insert could be deduplicated at the source table while the MV still wrote duplicates downstream — which made `async_insert` genuinely unsafe in MV pipelines. That limitation is gone, which meaningfully reopens the MV option if you had ruled it out on an earlier version.
+**Relevant to 26.1:** async-insert deduplication now extends end-to-end to dependent materialized
+views. Previously a retried async insert could be deduplicated at the source table while the MV
+still wrote duplicates downstream. That limitation is gone, which reopens the MV option for L1→L2
+if it was ruled out on an earlier version.
 
-**Measure.** End-to-end freshness latency, transform duration, rows-in vs rows-out fan-out ratio, and insert p99 with and without MVs attached.
+**Measure.** End-to-end freshness split by stage, L2 build duration, rows-in vs rows-out per build,
+partitions read per build, and insert p99 with and without MVs attached.
 
-**Covered by.** The `l1-transform-*` and `l2-report-build` workloads in `mixed-eod-peak`; the `pipeline-freshness` scenario (T5).
+**Covered by.** `pipeline-freshness` (T5); the `l2-build` workload in `mixed-eod-peak`.
 
 ---
 
 ### D9 — Resilience and chaos
 
-**Mechanism.** Four distinct failure surfaces: a ClickHouse replica, a Keeper node, the network between them, and the disk. Each has its own detection time, its own degraded behaviour, and its own recovery cost.
+**Mechanism.** Four failure surfaces: a ClickHouse replica, a Keeper node, the network between
+them, and the disk. Each has its own detection time, degraded behaviour and recovery cost.
 
-**Why it bites this cluster.** The topology has two single-failure cliffs. Two replicas means losing one halves your query capacity *and* forces the `insert_quorum` decision from D4. Three Keeper nodes means losing two makes every replicated table read-only — a full write outage, not a degradation.
+**Why it bites this cluster.** Two single-failure cliffs. Two replicas means losing one halves query
+capacity *and* forces the `insert_quorum` decision from D4. Three Keeper nodes means losing two
+makes every replicated table read-only — a full write outage, not a degradation.
 
-**Worked example — catch-up after a one-hour outage.** A replica is down for an hour of OS patching during a 24-hour ingest:
+**Worked example — catch-up after a one-hour outage.** A replica down for an hour of OS patching
+during a business day, at ~55 GB/date ≈ 0.64 MB/s average:
 
-- Missed data: 18 MB/s × 3,600 s = **~65 GB** to fetch
-- Over 10 GbE at a realistic 200–400 MB/s: **3–6 minutes** of catch-up
-- But if `max_replicated_fetches_network_bandwidth` is capped at, say, 50 MB/s to protect the live workload: **~22 minutes**
+- Missed data: ~2.3 GB to fetch
+- Over 10 GbE at 200–400 MB/s: **under a minute**
+- Even throttled to 50 MB/s: **~1 minute**
 
-And catch-up competes with the ongoing ingest it is trying to catch up *to*. If fetch throughput is below the ingest rate the replica never converges — it just falls further behind, which is why a flat-and-high `ReplicationQueueSize` means "stuck", not "busy".
+At current volumes catch-up is cheap. This changes the framing from the previous revision, which
+assumed 18 MB/s of ingest and produced 3–22 minute catch-ups. **The exposure now is a long outage
+or a stress run**, not routine patching.
 
-**Worked example — restart with a high part count.** Startup attaches every active part. At roughly 1–5 ms per part, a table carrying 50,000 parts takes **50–250 seconds just to attach** before it serves a single query. Teams consistently quote a restart time measured on a quiet cluster and then discover the real one during an incident. Chaos C10 exists to put a number on it.
+**Worked example — restart with a high part count.** Startup attaches every active part. At roughly
+1–5 ms per part, a replica carrying 40,000 parts across ~60 tables takes **40–200 seconds just to
+attach** before serving a query. With ~660 partitions per table this is a real number even at
+healthy per-partition counts, and it is the one teams consistently under-quote. Chaos C10 exists to
+measure it.
 
-**Detection times to verify.** Keeper `session_timeout_ms` defaults to 30,000 — so a replica can take up to 30 s to notice it has lost its session, during which its behaviour is worth watching closely.
+**Detection times to verify.** Keeper `session_timeout_ms` defaults to 30,000, so a replica can take
+up to 30 s to notice it has lost its session.
 
-**Measure.** Time-to-detect (`ReplicaIsReadOnly` / `ReplicaSessionExpired` transitions — the harness raises these as automatic marks), time-to-recover, catch-up rate, and **zero data loss** as a non-negotiable.
+**Measure.** Time-to-detect (`ReplicaIsReadOnly` / `ReplicaSessionExpired` transitions, which the
+harness raises as automatic marks), time-to-recover, catch-up rate, and **zero data loss** as
+non-negotiable.
 
-**Covered by.** `chaos-replica-kill` plus chaos C1–C10 in the playbook.
+**Covered by.** `chaos-replica-kill` plus chaos C1–C10.
 
 ---
 
 ### D10 — Endurance and soak
 
-**Mechanism.** Nothing new — this is D3, D6, D7 and D17 observed over a long enough window for a slow slope to become a wall.
+**Mechanism.** Nothing new — D3, D4, D6, D7 and D17 observed over a window long enough for a slow
+slope to become a wall.
 
-**Why it bites this cluster.** Every fast-moving failure has already been caught by the time you go live. What is left is the slow ones, and by construction they are invisible to short tests.
+**Why it bites this cluster.** Every fast-moving failure is caught before go-live. What remains is
+the slow ones, and by construction they are invisible to short tests. This architecture has more of
+them than the previous revision assumed, because partition count multiplies several accumulating
+quantities.
 
-**Four things only a soak can see.**
+**Five things only a soak can see.**
 
-1. **Part-count drift.** Covered in D3: +0.01 parts/s is 8.3 hours to failure. A 30-minute run sees a flat line.
-2. **Memory creep.** `jemalloc.resident` trending up while workload is constant. Mark cache alone grows to `mark_cache_size` (default 5 GB) and stays there.
-3. **System log growth.** See D17 — measured in GB/day, invisible in minutes.
-4. **Keeper znode accumulation.** `replicated_deduplication_window_seconds` is **604,800 — seven days**. Block znodes accumulate for a full week before the retention window starts evicting them. **A 24-hour soak cannot see the steady state of Keeper memory.** If Keeper sizing matters to you — and with three nodes it does — you need a 7-day run.
+1. **Total parts per table drift.** Not per-partition — the aggregate across ~660 partitions, which
+   is the D3 blind spot.
+2. **Keeper znode accumulation.** Part znodes never expire. This is the headline soak metric for
+   this architecture.
+3. **Memory creep.** `jemalloc.resident` trending up while workload is constant.
+4. **System log growth.** See D17 — GB/day, invisible in minutes.
+5. **Block znode steady state.** `replicated_deduplication_window_seconds` is **604,800 — seven
+   days**. Block znodes accumulate for a full week before eviction starts. **A 24-hour soak cannot
+   see the steady state of Keeper memory.** With three Keeper nodes, a `soak-7d` before go-live is
+   the only thing that establishes the true working set.
 
-That last point is worth planning around explicitly: `soak-24h` is the default, but a `soak-7d` before go-live is the only thing that establishes the true Keeper working set.
+**Read the report differently.** For a soak the percentiles are almost beside the point. **A flat
+p99 with a rising part count or znode count is a failed soak.** Look at slopes: total parts per
+table, znode count, resident memory, disk used, replication lag. Anything that trends instead of
+oscillating is a finding.
 
-**Read the report differently.** For a soak, the percentiles are almost beside the point. **A flat p99 with a rising part count is a failed soak.** Look at slopes: part count, resident memory, disk used, znode count, replication lag. Anything that trends instead of oscillating is a finding.
-
-**Covered by.** `soak-24h`, and a `soak-7d` variant for Keeper steady state.
+**Covered by.** `soak-24h`, and `soak-7d` for Keeper steady state.
 
 ---
 
 ### D11 — Correctness under stress
 
-**Mechanism.** `ReplicatedMergeTree` deduplicates inserts by **block checksum** by default, retaining hashes per `replicated_deduplication_window` = 100 blocks per partition / 7 days. If an inserted block hashes identically to a recently seen one, it is silently discarded — no error, no warning, no row.
+**Mechanism.** `ReplicatedMergeTree` deduplicates inserts by block checksum *unless* an
+`insert_deduplication_token` is supplied, in which case the token determines identity. This system
+always supplies one.
 
-**Why it bites this cluster.** That default is exactly right for retry safety and exactly wrong for a benchmark, and the failure is silent in both directions.
+**What that eliminates.** The classic false-positive — two genuinely different snaps of an unchanged
+low-cardinality curve serialising to byte-identical blocks and the second being silently dropped —
+**cannot happen here**, because identity comes from the token, not the bytes. The previous revision
+flagged this as a primary risk; the token design closes it.
 
-**Worked example — the false positive.** `l0_rates_market_data` is deliberately low-cardinality: a few hundred curves, 23 tenors, 4 quote types. Two genuinely different snaps of an unchanged curve can serialise to **byte-identical blocks**. ClickHouse drops the second one as a retry. You lose real data and nothing anywhere reports an error. Reconciliation is the only thing that catches it.
+**What that creates instead.** Bulk rows get a **fresh UUIDv7 token per call**, which deduplicates
+retries *within* a call and nothing else. So:
 
-**Worked example — the false negative.** A benchmark harness that reuses a pool of pre-generated batches inserts the same bytes repeatedly. ClickHouse deduplicates nearly all of them. The harness reports magnificent throughput because it is measuring how fast ClickHouse can *reject* data. This is a real and common way benchmark numbers end up meaningless — and it is why `BatchFactory` generates every batch fresh and stamps a unique `insert_deduplication_token` on each one.
+- A retried call → deduplicated. Correct.
+- A **replayed job** → new call, new token, new replay version → **rows are written again, by
+  design**, under a new version.
 
-**The three checks, in increasing order of severity.**
+Replays are *versioned, not deduplicated*. That is coherent, and it moves the correctness question
+from "were rows duplicated?" to **"does every consumer filter to the correct replay version?"**
+
+**The open risk.** `UNVERIFIED:` does the L2 build filter to the latest replay version? If it reads
+all versions, a replayed job double-counts into L2 — and the read-before-write guard on meta will
+not catch it, because the meta row is correct. This is the same failure class as D18's double-fired
+trigger, reached by a different path, and it reports as success.
+
+**The correctness boundary is the job, not the row.** Because L0 and L1 are written by two separate
+inserts and completion is signalled per job, the meaningful check is: *for job J, did every message
+produce its L0 row and all its L1 rows across every target table, at the same replay version?*
+
+**The four checks, in increasing order of severity.**
 
 | Check | Question | What a gap means |
 |---|---|---|
-| Acknowledgement | Rows offered = rows ClickHouse said it wrote? | Inserts failed, or were deduplicated away |
+| Acknowledgement | Rows offered = rows ClickHouse said it wrote? | Inserts failed |
+| **Job completeness** | For job J: L0 rows present *and* all L1 rows present, same replay version? | The L0/L1 window opened and was not closed |
 | Persistence | Does a `count()` see those rows? | A part never committed |
 | **Replica convergence** | Do both replicas hold identical counts? | **One replica quietly stopped replicating** — and your "fast" run was fast because it was only doing half the work |
 
-Convergence is checked after a settling delay, since replication is asynchronous and an immediate comparison would report a false mismatch on a healthy cluster.
+Convergence is checked after a settling delay, since replication is asynchronous.
 
-**The application-side implication.** `insert_deduplication_token` lets `ingestion-service` control block identity explicitly rather than relying on byte-identity. For a risk store where genuinely identical payloads are plausible, that is the correct design — and it needs deciding in the service, not the database.
+**Measure.** Job-level completeness against `l0_meta`/`l1_meta`, `recon.rowsLost`, replay-version
+distribution in L2 output, and per-table `sum(rows)` from `system.parts` compared across replicas.
 
-**Measure.** `recon.rowsLost`, distinct-key counts vs inserted counts, and per-table `sum(rows)` from `system.parts` compared across replicas.
-
-**Covered by.** The `reconciliation` block in every scenario; `chaos-replica-kill` for the fault case.
+**Covered by.** The `reconciliation` block in every scenario; `chaos-replica-kill` for the fault
+case; `trigger-redelivery` (new) for the replay-version case.
 
 ---
 
 ### D12 — Breaking-point and capacity discovery
 
-**Mechanism.** Ramp load continuously until an SLO breaks. Record the rate at first breach and which SLO it was.
+**Mechanism.** Ramp load continuously until an SLO breaks. Record the rate at first breach and which
+SLO it was.
 
-**Why it bites this cluster.** "Does it pass at expected peak?" is a yes/no that carries no information about margin. A cluster that passes at 100% of expected peak and breaks at 105% is in a completely different position from one that breaks at 400%, and both report "PASS".
+**Why it bites this cluster.** "Does it pass at expected peak?" carries no information about margin.
+A cluster that passes at 100% and breaks at 105% is in a completely different position from one
+that breaks at 400%, and both report "PASS".
 
-**Worked example.** `breaking-point` ramps to 1M rows/s. Suppose the point-lookup canary (`q_valuation_point_lookup` p99 > 1 s) breaches first at 340k rows/s:
+**Worked example.** If `breaking-point` ramps to 1M rows/s and a point-lookup canary breaches first
+at 340k rows/s, against a derived peak of ~65k rows/s:
 
-> headroom = 340,000 ÷ 120,000 = **2.8×**
+> headroom = 340,000 ÷ 65,000 = **5.2×**
 
-**Why 3× is the floor for this specific topology**, not a round number:
+**Why ~3× is the floor for this topology**, not a round number:
 
 | Claim on headroom | Factor |
-|---|---|
+|---|--:|
 | Losing one of two replicas halves query capacity | 2.0× |
-| EOD burst above steady-state average | ~1.3× |
+| Regional EOD burst above daily average | ~1.3× |
 | Backfill / replay running alongside live ingest | ~1.2× |
 | Volume growth before the next hardware cycle | ~1.2× |
 
-Those compound past 3×. At 2.8× measured, you are already below the floor — and the useful part is that you know it now, with the specific first-breaking component named, rather than discovering it at quarter-end.
+Those compound past 3×. Note that the derived peak of ~65k rows/s is roughly half the previous
+revision's assumption, so measured headroom may be considerably better than feared — but the
+headroom *requirement* is unchanged, and it is the ratio that matters.
 
-**The canary matters more than the headline.** Note that the first thing to break was a *query*, not an insert. A point lookup that should take milliseconds taking seconds is the cleanest possible saturation signal, because it has no legitimate reason to be slow. Insert throughput often keeps climbing for a while after the cluster has effectively stopped serving anyone.
+**The canary matters more than the headline.** A point lookup that should take milliseconds taking
+seconds is the cleanest saturation signal, because it has no legitimate reason to be slow. Insert
+throughput often keeps climbing after the cluster has stopped serving anyone.
 
-**Expect this scenario to fail.** A `breaking-point` run that passes has not found the knee — it just means the ramp ceiling was too low.
+**Expect this scenario to fail.** A `breaking-point` run that passes has not found the knee — the
+ramp ceiling was too low.
 
 **Covered by.** `breaking-point`.
 
@@ -383,156 +688,274 @@ Those compound past 3×. At 2.8× measured, you are already below the floor — 
 
 ### D13 — Maintenance operations under load
 
-**Mechanism.** These operations differ enormously in cost, and the differences are not obvious from the SQL:
+**Mechanism.** These operations differ enormously in cost, and the differences are not obvious from
+the SQL:
 
 | Operation | Cost | Notes |
 |---|---|---|
 | `ALTER TABLE … ADD COLUMN` | Metadata only | Brief lock; effectively free |
 | `ALTER TABLE … UPDATE/DELETE` (mutation) | **Rewrites every affected part** | Full read+write of matched data |
 | Lightweight `DELETE` | Writes a `_row_exists` mask | Cheaper, but still a mutation |
-| `OPTIMIZE … FINAL` | Rewrites the entire table | Never run this on a large table in production |
-| `DROP PARTITION` | Effectively instant | **The right tool for retention** |
-| TTL expiry | TTL merges | Consumes the same background pool as normal merges |
+| `OPTIMIZE … FINAL` | Rewrites the entire table | Never on a large table in production |
+| `DROP PARTITION` | Effectively instant | **The right tool, and here it works per site** |
+| TTL expiry | TTL merges | Same background pool as normal merges |
 
-**Why it bites this cluster.** Mutations draw from the same `background_pool_size` as merges. A mutation and a merge backlog are the same resource contest, so a routine data fix is a part-count risk.
+**The partition key pays off here.** Because partitions are `(cob_date, site)`, correcting or
+replaying one site's data for one date is a `DROP PARTITION` — metadata-only. Under a date-only
+key the same correction would be a mutation rewriting every site's data for that date. **This is
+the operational argument that decides the partition-key question**, and it is worth protecting when
+the schema evolves.
 
-**Worked example — the 17:30 data fix.** Someone corrects a valuation model tag during EOD peak:
+**Why mutations still bite.** They draw from the same `background_pool_size` as merges, so a routine
+data fix is a part-count risk.
+
+**Worked example — the data fix that should have been a partition drop.**
 
 ```sql
 ALTER TABLE riskstore.l1_rates_valuation UPDATE valuation_model = 'LMM-1'
-WHERE business_date = today();
+WHERE cob_date = today();
 ```
 
-On one business date of `l1_rates_valuation` (200M rows, 12 GB) that mutation rewrites **12 GB of parts**. Those rewrites compete with the merges that are currently just barely keeping up with 120k rows/s of ingest. Merges fall behind → part count climbs → D3. The mutation was not wrong; it was just issued at the one time of day when there was no slack.
+That predicate spans **all 30 sites**, so it rewrites every partition for the date rather than the
+one that needed correcting. Scoping it to `WHERE cob_date = today() AND site = 'LOH'` — or better,
+dropping and replaying that partition — turns a 30-partition rewrite into a single-partition
+operation. **Mutation predicates that omit `site` are the specific anti-pattern to watch for.**
 
-This is the most common self-inflicted production incident in a ClickHouse risk store, and the mitigation is operational (a maintenance window, or a mutation-throttling policy) rather than technical.
+**Measure.** `system.mutations` `parts_to_do` and `is_done`, `MutationsPending`, insert p99 during
+the mutation, and **partitions touched per mutation**. A `MutationsPending` count that does not
+trend to zero means stuck, not slow.
 
-**Note the retention implication.** Since `DROP PARTITION` is nearly free and `DELETE` is expensive, partitioning by business date is not just a query optimisation — it is what makes retention cheap. That is worth protecting when the schema evolves.
-
-**Measure.** `system.mutations` `parts_to_do` and `is_done`, `MutationsPending`, and insert p99 during the mutation. A `MutationsPending` count that does not trend to zero means the mutation is stuck, not slow.
-
-**Covered by.** The `maintenance-under-load` scenario (T9); chaos C9.
+**Covered by.** `maintenance-under-load` (T9); chaos C9.
 
 ---
 
 ### D14 — Backup and restore
 
-**Mechanism.** `BACKUP TABLE … TO Disk(…)` reads every active part. `RESTORE` writes them back. Both are large sequential IO workloads against the same device serving live traffic.
+**Mechanism.** `BACKUP TABLE … TO Disk(…)` reads every active part; `RESTORE` writes them back. Both
+are large sequential IO workloads against the device serving live traffic.
 
-**Why it bites this cluster.** Your RTO is not a policy statement — it is a measured wall-clock number, and it is probably larger than anyone has assumed.
+**Why it bites this cluster.** RTO is not a policy statement — it is a measured wall-clock number,
+and it is probably larger than anyone has assumed.
 
-**Worked example.** At ~3.5 TB of data and a sustained 200 MB/s to the backup target:
+**Worked example, at 1-month retention.** ~1.2 TB at a sustained 200 MB/s:
 
-> 3,500 GB ÷ 0.2 GB/s ≈ **4.9 hours**
+> 1,200 GB ÷ 0.2 GB/s ≈ **1.7 hours**
 
-That is your backup window, and during it the live workload is sharing the device. `RESTORE` is the same order of magnitude — so **your realistic RTO for a full rebuild is on the order of 5 hours**, before any validation. If the business has been told "we can recover in an hour", this is the number that corrects it.
+At the current 3-month TTL (~3.6 TB) the same arithmetic gives **~5 hours**. **Shortening the TTL
+cuts your RTO by the same factor it cuts your footprint** — a third argument for 1 month that has
+nothing to do with disk pressure.
 
-**What to test.** Not just the duration, but the *degradation*: run `mixed-eod-peak` and start a backup mid-run. The interesting question is whether inserts still meet SLO while the backup streams. Incremental backups via `base_backup` reduce the window substantially and are worth measuring separately.
+**What to test.** Not just duration but *degradation*: run `mixed-eod-peak` and start a backup
+mid-run. The question is whether inserts still meet SLO while the backup streams. Incremental
+backups via `base_backup` reduce the window substantially and are worth measuring separately.
 
-With two replicas both holding the full dataset, you can take the backup from either — but they share nothing, so backing up from one does not spare the other's disk any IO if queries are routed to both.
+**Measure.** Backup wall-clock, restore wall-clock (your RTO), and insert/query p99 delta during the
+backup window.
 
-**Measure.** Backup wall-clock, restore wall-clock (your RTO), and insert/query p99 delta during the backup window.
-
-**Covered by.** Not in the shipped scenario suite — flagged as an addition once the backup target and schedule are chosen.
+**Covered by.** Not in the shipped scenario suite — flagged as an addition once the backup target
+and schedule are chosen.
 
 ---
 
 ### D15 — Cold-start and cache effects
 
-**Mechanism.** Four caches stack up: the mark cache (`mark_cache_size`, default 5 GB), the uncompressed cache (off by default), the query cache (off by default), and — by far the largest — the **OS page cache**, which on this box is effectively the ~450 GB of RAM ClickHouse has not claimed.
+**Mechanism.** Four caches stack: the mark cache (`mark_cache_size`, default 5 GB), the uncompressed
+cache (off by default), the query cache (off by default), and — by far the largest — the **OS page
+cache**, effectively the ~450 GB of RAM ClickHouse has not claimed.
 
-**Why it bites this cluster.** With ~500 GB of RAM and ~3.5 TB of data, roughly 15% of the dataset is resident. But that 15% is not random: it is the recently-touched data, which means **the current business date very likely fits entirely in page cache**. A query against today's data can be 10–50× faster than the identical query against last month's.
+**Why it bites this cluster, and why the TTL decision changes it.** At 3-month retention (~3.6 TB)
+roughly 12% of the dataset is resident. **At 1-month retention (~1.2 TB), closer to 40% is** — and
+since the resident portion is the recently-touched data, the current and recent business dates
+very likely sit entirely in page cache. A query against today's data can be 10–50× faster than the
+identical query against the oldest retained date.
 
-**Worked example — the SLO that actually matters.** `q_pnl_explain_by_book` against a warm current business date might return in 400 ms. The same query as the *first* report of the morning, after an overnight restart, reads from disk and takes 12 seconds. Both are true. Only one of them is what your users experience at 07:00, and it is not the one that makes the benchmark look good.
+Shortening the TTL therefore *improves* cache hit rates substantially. It also widens the cold/warm
+gap in relative terms, which makes cache discipline more important, not less.
 
-**This is the dimension that silently invalidates everything else.** If cache state is not pinned, a "regression" between two runs is just as likely to be a warm run compared against a cold one. Any percentage comparison between differently-cached runs is noise dressed up as a finding.
+**Worked example — the SLO that actually matters.** An L2 report query against a warm current
+`(cob_date, site)` might return in 400 ms. The same query as the *first* report of the morning,
+after an overnight restart, reads from disk and takes many seconds. Both are true. Only one is what
+users experience at 07:00, and it is not the one that makes the benchmark look good.
 
-**The discipline.** `SYSTEM DROP MARK CACHE / UNCOMPRESSED CACHE / QUERY CACHE / COMPILED EXPRESSION CACHE` clears what SQL can reach. It does **not** clear the OS page cache — that needs an operator running `sync && echo 3 > /proc/sys/vm/drop_caches` on every replica. The harness applies the SQL half, prints the manual step into the report, and records which policy was in force, so a cold run is auditable rather than assumed.
+**This is the dimension that silently invalidates everything else.** If cache state is not pinned, a
+"regression" between two runs is just as likely to be a warm run compared against a cold one. Any
+percentage comparison between differently-cached runs is noise dressed as a finding.
 
-**Quote both numbers.** Cold and warm are both legitimate measurements. Quoting only one is how benchmark figures stop matching production.
+**The discipline.** `SYSTEM DROP MARK CACHE / UNCOMPRESSED CACHE / QUERY CACHE / COMPILED EXPRESSION
+CACHE` clears what SQL can reach. It does **not** clear the OS page cache — that needs an operator
+running `sync && echo 3 > /proc/sys/vm/drop_caches` on every replica. The harness applies the SQL
+half, prints the manual step into the report, and records which policy was in force.
 
-**Measure.** Cold and warm variants of the same scenario, run and reported separately; `MarkCacheBytes`; `OSMemoryAvailable`.
+**Quote both numbers.** Cold and warm are both legitimate. Quoting only one is how benchmark figures
+stop matching production.
 
-**Covered by.** `query-baseline-cold`, with a warm variant to run alongside it.
+**Measure.** Cold and warm variants of the same scenario reported separately; `MarkCacheBytes`;
+`OSMemoryAvailable`.
+
+**Covered by.** `query-baseline-cold`, with a warm variant alongside.
 
 ---
 
 ### D16 — Client and connection layer
 
-**Mechanism.** The boundary between `ingestion-service` and ClickHouse has its own limits, and failures there are invisible in ClickHouse's own metrics.
+**Mechanism.** The boundary between `riskstore-ingestion-service` and ClickHouse has its own limits,
+and failures there are invisible in ClickHouse's own metrics.
 
-**Why it bites this cluster.** When ClickHouse rejects work, what the *client* does next determines whether you have an incident or an outage.
+**Why it bites this cluster.** When ClickHouse rejects work, what the *client* does next determines
+whether you have an incident or an outage.
 
-**Worked example — the retry storm.** Part count crosses 300 and ClickHouse starts throwing `TOO_MANY_PARTS`:
+**Worked example — the retry storm.** Part count crosses 300 and ClickHouse throws
+`TOO_MANY_PARTS`:
 
-1. `ingestion-service` receives the error and retries immediately.
+1. The ingestion service receives the error and retries immediately.
 2. The retry is also rejected — the part count has not changed in 50 ms.
-3. Retries now arrive faster than original traffic, adding connection and parsing load to a server already unable to merge fast enough.
-4. The retry traffic makes it *harder* for merges to catch up, because they are competing for the same CPU.
+3. Retries now arrive faster than original traffic, adding load to a server already unable to merge
+   fast enough.
+4. The retry traffic makes it *harder* for merges to catch up.
 
-A recoverable back-pressure signal becomes a self-sustaining outage. The fix is client-side — exponential backoff with jitter, and a circuit breaker on `TOO_MANY_PARTS` specifically — but you only find out it is missing by generating the condition.
+A recoverable back-pressure signal becomes a self-sustaining outage. The fix is client-side —
+exponential backoff with jitter, and a circuit breaker on `TOO_MANY_PARTS` specifically — but you
+only find out it is missing by generating the condition.
 
-**Worked example — invisible queueing.** If the service's connection pool is smaller than its concurrency, requests queue *inside the application*. ClickHouse sees healthy latency and low concurrency; the business sees slow risk. Nothing in `system.query_log` reveals it. This is a strong argument for eventually running the end-to-end variant of the harness as well as the DB-direct one — the DB-direct mode this harness implements is deliberately blind to it.
+**Worked example — invisible queueing.** If the connection pool is smaller than the service's
+concurrency, requests queue *inside the application*. ClickHouse sees healthy latency and low
+concurrency; the business sees slow risk. Nothing in `system.query_log` reveals it.
 
-**Limits to exercise.** `max_concurrent_queries` (rejection arrives as code 202, `TOO_MANY_SIMULTANEOUS_QUERIES`), connection pool sizing, HTTP (8123) vs native (9000) protocol overhead, `keep_alive_timeout`, and TLS handshake cost if TLS is enabled.
+**Limits to exercise.** `max_concurrent_queries` (rejection arrives as code 202,
+`TOO_MANY_SIMULTANEOUS_QUERIES`), connection pool sizing, HTTP (8123) vs native (9000) overhead,
+`keep_alive_timeout`, and TLS handshake cost if enabled.
 
-**Measure.** Rejection rate by error code, `TCPConnection` / `HTTPConnection` counts, and client-side queue depth — which only the application can report.
+**Measure.** Rejection rate by error code, `TCPConnection` / `HTTPConnection` counts, and
+client-side queue depth — which only the application can report.
 
-**Covered by.** `breaking-point` reaches the rejection regime; the retry behaviour itself belongs to `ingestion-service` and should be tested there.
+**Covered by.** `breaking-point` reaches the rejection regime; retry behaviour belongs to the
+ingestion service and should be tested there.
 
 ---
 
 ### D17 — Observability self-overhead
 
-**Mechanism.** `system.query_log`, `part_log`, `metric_log`, `asynchronous_metric_log`, `trace_log` and `text_log` are not lightweight instrumentation — they are ordinary MergeTree tables with ordinary inserts, parts, merges and disk consumption. They compete with your data for the same resources.
+**Mechanism.** `system.query_log`, `part_log`, `metric_log`, `asynchronous_metric_log`, `trace_log`
+and `text_log` are ordinary MergeTree tables with ordinary inserts, parts, merges and disk cost.
+They compete with your data for the same resources.
 
-**Why it bites this cluster.** Default TTLs on system log tables are inconsistent across versions and deployments — **modern builds commonly default to 30 days, but historically there was no TTL at all**. Verify it on your actual 26.1 build rather than assuming, because unbounded is a genuine possibility and the growth is invisible until it is not.
+**Why it bites this cluster.** Default TTLs on system log tables are inconsistent across versions —
+**modern builds commonly default to 30 days, but historically there was no TTL at all**. Verify on
+your actual 26.1 build rather than assuming.
 
-**Worked example — the daily budget.**
+**Worked example — the daily budget.** At ~58,000 inserts/date plus L2 builds and report queries:
 
 | Table | Volume | Size/day |
 |---|---|--:|
-| `query_log` | 2 rows/query; `ProfileEvents` map makes rows 2–5 KB. At 5 qps sustained = 432k queries/day | **~2.6 GB** |
-| `part_log` | ~12 rows/s (6 parts created + ~6 merged) ≈ 1M rows/day | **~1 GB** |
+| `query_log` | 2 rows/query; `ProfileEvents` map makes rows 2–5 KB | **~0.5 GB** |
+| `part_log` | ~58,000 parts created + merges ≈ 150k rows/day | **~0.15 GB** |
 | `metric_log` | 1 row/s, ~3,000 columns wide | **~0.3 GB** |
 | `asynchronous_metric_log` | 1 row/s | **~0.1 GB** |
-| **Subtotal, profiler off** | | **~4 GB/day** |
+| **Subtotal, profiler off** | | **~1 GB/day** |
 | `trace_log` **with query profiler enabled** | Samples per thread per millisecond | **10× everything else** |
 
-At 4 GB/day with a 30-day TTL that is **120 GB — about 3.4% of your usable disk**. Acceptable, but it must be budgeted rather than discovered.
-
-With `trace_log` left on in production, the same arithmetic gives **~40 GB/day → 1.2 TB**, which would consume roughly **a third of your usable capacity** to store telemetry about a database that is running out of room to store risk. The failure presents as D7.
+At ~1 GB/day with a 30-day TTL that is **30 GB — under 1% of usable disk**. Comfortable, and
+materially smaller than the previous revision estimated because the insert and query rates are
+lower than assumed. With `trace_log` left on, ~10 GB/day → 300 GB, which is ~9% of usable — still
+survivable but no longer free.
 
 **Recommendations to validate on your build.**
 
 - Confirm the TTL actually set on each `system.*_log` table; set one explicitly if absent.
 - Keep `trace_log` **off** by default; enable it deliberately when investigating.
 - Consider widening `metric_log` `collect_interval_milliseconds` from its default.
-- Include `system.*` tables in the D7 capacity projection, not as an afterthought.
+- Include `system.*` tables in the D7 projection, not as an afterthought.
 
-**Note the harness's own contribution.** The system-table scraper polls every 2 seconds across both replicas. That is small against a saturated cluster but it is not zero, and the report states it rather than pretending otherwise.
+**Note the harness's own contribution.** The system-table scraper polls every 2 seconds across both
+replicas. Small against a saturated cluster but not zero, and the report states it.
 
-**Measure.** `SystemLogBytes` per table (the `system_log_footprint` probe), and the growth slope across a soak run.
+**Measure.** `SystemLogBytes` per table, and the growth slope across a soak run.
 
-**Covered by.** `soak-24h`; the `system_log_footprint` probe in the metric catalogue.
+**Covered by.** `soak-24h`; the `system_log_footprint` probe.
+
+---
+
+### D18 — Job completion and trigger semantics *(new)*
+
+**Mechanism.** L2 is built when `riskstore-report-service` consumes a Kafka notification published
+after every message for a job has landed in L0 and L1. That notification is the **sole gate** on
+every downstream report.
+
+**Why it bites this cluster.** Kafka delivery is **at-least-once**. A consumer rebalance, a
+processing timeout, or a report-service restart mid-build all redeliver the same notification. So
+job J's L2 build can run twice, possibly concurrently.
+
+**Worked example — the double-counted report.** The trigger for job J is redelivered:
+
+1. Two L2 builds for J start, possibly on different report-service instances.
+2. Each issues `INSERT … SELECT` into ~10 L2 tables.
+3. Block-level dedup does **not** save you: two concurrent builds read L1 with different thread
+   scheduling, produce different row ordering, different checksums, and no deduplication.
+4. L2 now holds duplicate rows. Every downstream report double-counts.
+5. Nothing reports an error. `l2_meta` looks correct.
+
+**The replay-version path reaches the same failure.** A replayed job writes new rows under a new
+replay version. If the L2 build does not filter to the latest version, it reads both and
+double-counts — with correct meta rows and no error.
+
+**What idempotency requires.** Running the build twice must leave the same end state. Options, in
+rough order of robustness for this design:
+
+| Approach | How it works | Cost |
+|---|---|---|
+| `DROP PARTITION` + rebuild | Build is scoped to one `(cob_date, site)`; drop then insert | Cheapest here — the partition key already supports it |
+| Deterministic `insert_deduplication_token` | Keyed on `(job_id, target_table, replay_version)` | Cheap; matches the existing meta-row pattern |
+| `ReplacingMergeTree` with version | Dedup at merge time | Reads need `FINAL` or careful queries |
+| Job-status guard | Refuse a second build | Racy under concurrency unless properly locked |
+
+**What to verify, and it is cheap to test.** Fire the trigger twice for the same job and assert L2
+row counts do not move. Then fire it twice *concurrently*. Then replay a job and assert L2 reflects
+only the latest replay version.
+
+**Other failure modes in this dimension.**
+
+- **A job whose last message never arrives** never triggers, so L2 silently never builds. What is
+  the timeout, and what raises the alarm?
+- **Job size distribution** — a very large job holds up L2 for everything downstream of it.
+- **Trigger storm** — many jobs completing at once (a regional close) firing many concurrent L2
+  builds, which is a D5 and D6 event as well as a D18 one.
+
+**Measure.** Trigger→L2-complete latency, concurrent L2 builds, L2 row counts under deliberate
+redelivery, replay-version distribution in L2 output, and count of jobs with L0/L1 complete but no
+L2 after a threshold.
+
+**Covered by.** `trigger-redelivery` (new), `pipeline-freshness` (T5), `mixed-eod-peak` for the
+trigger-storm case.
 
 ---
 
 ## Part 2 — Harness design
 
+> Build-out is deferred until the planning assumptions below are locked. This section is the target
+> design, updated for the real architecture, not a commitment to a build order.
+
 ### 2.1 Non-negotiable measurement principles
 
-These are the difference between a benchmark and a number generator. Each is a hard requirement on the implementation:
+These are the difference between a benchmark and a number generator:
 
-1. **Open-loop load generation.** Arrivals are scheduled against a virtual clock at a fixed rate, independent of whether prior requests have completed. A closed-loop driver (N threads looping "send, wait, send") suffers *coordinated omission*: when the server stalls, the driver stops sending, so the stall never appears in the latency histogram. Latency is measured from **intended send time**, not actual send time.
-2. **Harness runs off-box.** On a separate load-generator host. Running it on a replica means measuring your own CPU contention.
-3. **Results DB is not the SUT.** Writing results into Riskstore would perturb the thing being measured. Results go to a separate ClickHouse instance/database (fallback: local JSONL/Parquet).
-4. **Percentiles are merged, never averaged.** Latencies are stored as serialized **HdrHistogram** per (workload, 10 s window). HdrHistograms merge losslessly, so a true global p99.9 is recoverable. Averaging per-window percentiles is arithmetically meaningless.
-5. **Steady-state windowing.** Ramp-up and cooldown are recorded but excluded from headline metrics.
-6. **Deterministic seeded data.** Same seed → same data → runs are comparable.
-7. **`query_id` correlation.** Every operation is stamped `{runId}:{workloadId}:{seq}` so client-side latency joins exactly to `system.query_log` server-side cost. This is what lets you say *"the p99 was 4 s and 3.6 s of it was server-side merge contention."*
-8. **`SYSTEM FLUSH LOGS` before harvest.** System log tables flush asynchronously (~7 s); harvesting without a flush loses the tail of the run.
-9. **Config fingerprinting.** Every run records SUT version, settings hash and schema hash. A run against different settings is not a comparable run.
+1. **Open-loop load generation.** Arrivals are scheduled against a virtual clock at a fixed rate,
+   independent of whether prior requests completed. A closed-loop driver suffers *coordinated
+   omission*: when the server stalls the driver stops sending, so the stall never appears in the
+   histogram. Latency is measured from **intended send time**.
+2. **Harness runs off-box.** On a separate load-generator host.
+3. **Results DB is not the SUT.** Results go to a separate ClickHouse instance (fallback: local
+   JSONL/Parquet).
+4. **Percentiles are merged, never averaged.** Serialized **HdrHistogram** per (workload, 10 s
+   window); HdrHistograms merge losslessly. Averaging per-window percentiles is meaningless.
+5. **Steady-state windowing.** Ramp-up and cooldown recorded but excluded from headline metrics.
+6. **Deterministic seeded data.** Same seed → same data → comparable runs.
+7. **`query_id` correlation.** Every operation stamped `{runId}:{workloadId}:{seq}` so client-side
+   latency joins to `system.query_log` server-side cost.
+8. **`SYSTEM FLUSH LOGS` before harvest.** System logs flush asynchronously (~7 s).
+9. **Config fingerprinting.** Every run records SUT version, settings hash and schema hash.
+10. **Model the real write shape.** *(new)* A job writes 4–5 tables into **one** `(cob_date, site)`
+    partition, with client-side fan-out and per-call UUIDv7 dedup tokens. A generator that writes a
+    single table, or spreads across partitions, is not testing this system.
 
 ### 2.2 Component architecture
 
@@ -546,16 +969,17 @@ Single fat JAR, one process:
                  │  RunCoordinator ── PhaseScheduler            │
                  │       │                                     │
                  │       ├─ ArrivalScheduler (open-loop)        │
-                 │       ├─ InsertDriver ──┐                    │
-                 │       ├─ QueryDriver ───┤                    │
-                 │       └─ DataGenerator ─┘                    │
+                 │       ├─ JobDriver ──────┐                   │
+                 │       ├─ L2BuildDriver ──┤                   │
+                 │       ├─ QueryDriver ────┤                   │
+                 │       └─ DataGenerator ──┘                   │
                  ├─────────────────────────────────────────────┤
                  │  Collectors:  LatencyRecorder (HdrHistogram) │
                  │               SystemTableScraper (1–5 s)     │
                  │               QueryLog / PartLog harvester   │
                  │               OsMetricsScraper               │
                  ├─────────────────────────────────────────────┤
-                 │  Verifier: Reconciler, SloEvaluator,         │
+                 │  Verifier: JobReconciler, SloEvaluator,      │
                  │            BaselineComparator                │
                  ├─────────────────────────────────────────────┤
                  │  ResultsWriter ──▶ separate ClickHouse       │
@@ -568,90 +992,109 @@ Single fat JAR, one process:
                     └───────────────────────┘
 ```
 
+`JobDriver` replaces the previous `InsertDriver`: the unit of work is a **job** writing 4–5 tables
+into one partition, not a single-table insert. `L2BuildDriver` replaces `InsertSelectDriver` and is
+trigger-shaped rather than cadence-shaped.
+
 ### 2.3 REST API contract
 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/v1/health` | Liveness |
-| `GET` | `/api/v1/preflight` | Cluster health, disk free, no competing load, config fingerprint vs baseline. **Blocks run start on failure.** |
+| `GET` | `/api/v1/preflight` | Cluster health, disk free, no competing load, config fingerprint. **Blocks run start on failure.** |
 | `GET` | `/api/v1/scenarios` | List loaded scenario definitions |
 | `POST` | `/api/v1/runs` | Start a run: `{scenarioId, overrides{}, tags{}, baselineRunId?}` → `202 {runId}` |
 | `GET` | `/api/v1/runs` | List runs, filterable by tag/status |
 | `GET` | `/api/v1/runs/{id}` | Live status: phase, elapsed, current rate, rolling p99, error count |
-| `POST` | `/api/v1/runs/{id}/marks` | **Chaos marker** — `{kind, target, note}` timestamps an operator-injected fault onto the run timeline |
+| `POST` | `/api/v1/runs/{id}/marks` | **Chaos marker** — `{kind, target, note}` timestamps an operator-injected fault |
 | `POST` | `/api/v1/runs/{id}/abort` | Graceful stop, still produces a report |
-| `GET` | `/api/v1/runs/{id}/report?format=json\|html\|md` | Final report |
+| `GET` | `/api/v1/runs/{id}/report?format=…` | Final report; format is one of json, html or md |
 | `GET` | `/api/v1/runs/{id}/compare/{baselineId}` | Regression delta |
 
-Safety guard: the harness refuses to start unless the target cluster name appears in a configured allowlist **and** `allowDestructive: true` is set — prevents ever pointing this at production by accident.
+Safety guard: the harness refuses to start unless the target cluster name appears in a configured
+allowlist **and** `allowDestructive: true` is set.
 
 ### 2.4 Scenario definition (YAML)
 
+Restructured around jobs and sites:
+
 ```yaml
-id: rates-peak-eod
-description: Rates EOD burst with concurrent L2 report generation
+id: rates-eod-apac
+description: Rates EOD for APAC sites with concurrent L2 builds
 seed: 42
+
+sut:
+  valueStreams: [rates]
+  sites: [HKG, SGP, SHH]        # follow-the-sun ordering
+  cobDates: 1                    # >1 exercises the multi-partition stress case
+
 phases:
-  - { id: warmup, type: hold, rate: 20000, for: PT5M, excludeFromMetrics: true }
-  - { id: ramp,   type: ramp, from: 20000, to: 120000, over: PT5M }
-  - { id: steady, type: hold, rate: 120000, for: PT30M }
-  - { id: spike,  type: hold, rate: 350000, for: PT5M }
+  - { id: warmup, type: hold, jobsPerMin: 5,  for: PT5M, excludeFromMetrics: true }
+  - { id: ramp,   type: ramp, from: 5, to: 40, over: PT5M }
+  - { id: steady, type: hold, jobsPerMin: 40, for: PT30M }
 
 workloads:
-  - id: l0-rates-atlas
-    kind: insert
-    target: { table: l0_rates_atlas, format: JSONEachRow }
-    share: 0.6                       # of the phase rate
-    batch: { rows: 50000, maxDelay: PT1S }
-    generator: { ref: rates-atlas-payload }
-    settings:
-      async_insert: 1
-      wait_for_async_insert: 1
-      insert_deduplication_token: "${runId}-${workloadId}-${seq}"
+  - id: rates-sensitivity-job
+    kind: job                          # writes 4-5 tables in one partition
+    tables:
+      meta:    [l0_meta, l1_meta]      # 2 rows each, deterministic token on FINISHED
+      payload: [l0_rates_atlas]
+      derived: [l1_rates_sensitivity, l1_rates_valuation]
+    messagesPerJob: { distribution: lognormal, median: 200, p95: 2000 }
+    fanout:
+      l1_rates_sensitivity: { distribution: lognormal, median: 12, p95: 400, max: 1000 }
+    batch: { rows: 20000, maxDelay: PT1S }
+    dedupToken: uuidv7PerCall          # matches production
 
-  - id: l1-transform
-    kind: insertSelect
-    sql: { ref: t_l0_to_l1_rates_valuation }
-    triggerEvery: PT1M
+  - id: l2-build
+    kind: l2Build
+    triggeredBy: rates-sensitivity-job
+    targets: [l2_rates_sensitivity_pls, l2_rates_valuation_pls]
+    redeliveryRate: 0.0                # raise to exercise D18
 
-  - id: l2-report
+  - id: reports
     kind: query
     arrivalRate: { unit: qps, value: 5 }
     queries:
       - { ref: q_pnl_explain_by_book, weight: 0.6 }
       - { ref: q_sensitivity_ladder,  weight: 0.4 }
-    cachePolicy: cold                # cold | warm | mixed
+    cachePolicy: cold
 
 slo:
-  - { metric: "insert.l0-rates-atlas.p99",     op: lte, value: PT2S }
-  - { metric: "query.q_pnl_explain_by_book.p95", op: lte, value: PT3S }
-  - { metric: "sut.MaxPartCountForPartition.max", op: lte, value: 300 }
+  - { metric: "job.rates-sensitivity-job.p99",      op: lte, value: PT30S }
+  - { metric: "query.q_pnl_explain_by_book.p95",    op: lte, value: PT3S }
+  - { metric: "sut.MaxPartCountForPartition.max",   op: lte, value: 300 }
+  - { metric: "sut.TotalPartsPerTable.max",         op: lte, value: 50000 }
+  - { metric: "sut.zookeeper.znode_count.max",      op: lte, value: 2000000 }
   - { metric: "sut.replication.absolute_delay.p99", op: lte, value: 30 }
-  - { metric: "errors.rate",                    op: lte, value: 0.001 }
-  - { metric: "recon.rowsLost",                 op: eq,  value: 0 }
+  - { metric: "errors.rate",                        op: lte, value: 0.001 }
+  - { metric: "recon.jobsIncomplete",               op: eq,  value: 0 }
+  - { metric: "recon.l2DuplicateRows",              op: eq,  value: 0 }
 ```
+
+All SLO thresholds are **placeholders** until the open items are settled.
 
 ### 2.5 Metric catalogue — exact SUT queries
 
-Scraped per replica on a 1–5 s cadence and stored as timeseries. These go in `src/main/resources/sql/sut-metrics/`:
+Scraped per replica on a 1–5 s cadence:
 
 | Area | Query / source |
 |---|---|
-| **Parts (D3)** | `SELECT database, table, count() active_parts, sum(rows), sum(bytes_on_disk), sum(files) FROM system.parts WHERE active GROUP BY 1,2` — note `files` is new in 26.1 |
-| **Part-count ceiling** | `SELECT value FROM system.asynchronous_metrics WHERE metric='MaxPartCountForPartition'` ← **the single most important early-warning signal** |
+| **Parts per partition (D3)** | `SELECT value FROM system.asynchronous_metrics WHERE metric='MaxPartCountForPartition'` |
+| **Total parts per table (D3)** | `SELECT table, uniqExact(partition) parts_partitions, count() total_parts, sum(rows), sum(bytes_on_disk), sum(files) FROM system.parts WHERE active GROUP BY table` ← **the metric the previous revision was missing** |
 | **Merges (D3)** | `SELECT count(), sum(total_size_bytes_compressed), max(elapsed), max(progress), sum(memory_usage) FROM system.merges` |
 | **Insert backpressure** | `ProfileEvents`: `DelayedInserts`, `RejectedInserts`, `DelayedInsertsMilliseconds` |
-| **Mutations (D13)** | `SELECT count() FROM system.mutations WHERE NOT is_done` |
+| **Mutations (D13)** | `SELECT count(), uniqExact(partition_id) FROM system.mutations WHERE NOT is_done` |
 | **Replication (D4)** | `SELECT database, table, absolute_delay, queue_size, inserts_in_queue, merges_in_queue, is_readonly, is_session_expired, active_replicas, total_replicas FROM system.replicas` |
-| **Replication queue** | `SELECT type, count(), max(num_tries), any(last_exception) FROM system.replication_queue GROUP BY type` |
-| **Keeper (D4)** | `SELECT * FROM system.zookeeper_info` — **new in 26.1**: cluster size, latency, leadership, data volume. Plus `system.zookeeper_connection` and `ProfileEvents.ZooKeeperTransactions` / `ZooKeeperWaitMicroseconds` |
-| **Memory (D6)** | `system.metrics`: `MemoryTracking`, `Query`, `Merge`, `BackgroundMergesAndMutationsPoolTask`; `system.asynchronous_metrics`: `jemalloc.resident`, `OSMemoryAvailable` |
-| **Storage (D7)** | `system.asynchronous_metrics`: `DiskAvailable_default`, `DiskUsed_default`; compression ratio from `sum(data_uncompressed_bytes)/sum(data_compressed_bytes)` on `system.parts` |
+| **Keeper memory (D4)** | `SELECT znode_count, approximate_data_size, watch_count, avg_latency, max_latency, outstanding_requests, synced_followers FROM system.zookeeper_info` ← **new in 26.1; znode_count is the headline** |
+| **Memory (D6)** | `system.metrics`: `MemoryTracking`, `Query`, `Merge`; `system.asynchronous_metrics`: `jemalloc.resident`, `OSMemoryAvailable` |
+| **Storage (D7)** | `DiskAvailable_default`, `DiskUsed_default`; bytes/row and compression from `system.parts` |
 | **Errors (D16)** | `SELECT name, value, last_error_message FROM system.errors WHERE value > 0` |
 | **Per-op server cost** | `SELECT query_id, type, query_duration_ms, read_rows, read_bytes, written_rows, memory_usage, peak_memory_usage, ProfileEvents, exception_code FROM system.query_log WHERE query_id LIKE '{runId}%'` |
-| **Part events** | `SELECT event_type, event_time, table, part_name, rows, size_in_bytes, duration_ms, merge_reason, peak_memory_usage, error FROM system.part_log WHERE ...` |
-| **Index efficacy** | `mergeTreeAnalyzeIndexes()` — **new in 26.1**, shows exact row ranges scanned after primary + skip indexes. Used in the query-tuning section of the detailed report. |
-| **OS** | node_exporter scrape if available, else a lightweight `/proc` reader agent |
+| **Partitions read per query (D6)** | `ProfileEvents['SelectedParts']`, `SelectedRanges` — the L2 scoping check |
+| **Part events** | `SELECT event_type, event_time, table, part_name, rows, size_in_bytes, duration_ms, merge_reason, peak_memory_usage, error FROM system.part_log` |
+| **Index efficacy** | `mergeTreeAnalyzeIndexes()` — new in 26.1 |
+| **OS** | node_exporter if available, else a `/proc` reader |
 
 ### 2.6 Results schema (separate ClickHouse DB `perf_results`)
 
@@ -661,41 +1104,55 @@ runs               (run_id, scenario_id, scenario_hash, started_at, ended_at, st
 run_phases         (run_id, phase_id, started_at, ended_at, target_rate, excluded)
 op_latency_hist    (run_id, workload_id, window_start, encoded_hdr String, count, min, max, errors)
 op_throughput      (run_id, workload_id, ts, ops, rows, bytes, errors)
+job_records        (run_id, job_id, value_stream, site, cob_date, replay_version,
+                    started_at, ended_at, tables_written, rows_written, l2_triggered_at)
 sut_metrics        (run_id, ts, node, metric, value)
 sut_query_log      (run_id, query_id, ...harvested columns...)
 sut_part_events    (run_id, ...harvested columns...)
 os_metrics         (run_id, ts, node, metric, value)
-chaos_events       (run_id, ts, kind, target, note, source)   -- operator marks + auto-detected
+chaos_events       (run_id, ts, kind, target, note, source)
 slo_results        (run_id, slo_id, metric, op, threshold, actual, passed)
-reconciliation     (run_id, check_name, expected, actual, passed, detail)
+reconciliation     (run_id, check_name, job_id, expected, actual, passed, detail)
 ```
+
+`job_records` is new — job-level reconciliation (D11) and trigger latency (D18) both need it.
 
 ### 2.7 Reporting
 
-Three outputs from one run:
-
-- **Summary (Markdown + top of HTML)** — a scorecard: PASS/FAIL per SLO, headline throughput and latency, the derived headroom factor, the first thing that broke, and a delta table vs the baseline run with regressions flagged. One screen. This is what goes in the go-live pack.
-- **Detailed HTML** — per-workload latency tables (p50/p90/p95/p99/p99.9/max, from merged HdrHistograms), throughput and latency timeseries, ClickHouse internals overlaid on the same time axis (part count, merge backlog, replication lag, Keeper latency, memory), resource utilisation, error breakdown, top-N slowest queries with server-side cost from `query_log`, and **chaos event markers overlaid on every chart**.
+- **Summary (Markdown + top of HTML)** — scorecard: PASS/FAIL per SLO, headline throughput and
+  latency, derived headroom factor, the first thing that broke, and a delta table vs baseline. One
+  screen. This goes in the go-live pack.
+- **Detailed HTML** — per-workload latency tables from merged HdrHistograms, throughput and latency
+  timeseries, ClickHouse internals on the same time axis (total parts per table, znode count, merge
+  backlog, replication lag, memory), error breakdown, top-N slowest queries with server-side cost,
+  and **chaos event markers overlaid on every chart**.
 - **JSON** — machine-readable, for a CI regression gate.
 
-> **On-prem constraint:** the HTML report must be **fully self-contained** — inline CSS and inline SVG charts, no CDN or external asset references. Assume the environment is air-gapped.
+> **On-prem constraint:** the HTML report must be **fully self-contained** — inline CSS and inline
+> SVG, no CDN or external asset references. Assume the environment is air-gapped.
+
+Every report must also state, prominently: **the in-process L0→L1 transform cost is not measured by
+this harness** (D8).
 
 ### 2.8 Chaos playbook (operator-triggered)
 
-The harness ships a playbook with exact commands, expected outcome, and pass criteria. The operator runs the fault and POSTs a mark; the harness correlates and scores automatically. It also **auto-detects** `is_readonly` / `is_session_expired` transitions and annotates them independently of the operator mark.
+The operator runs the fault and POSTs a mark; the harness correlates and scores automatically. It
+also **auto-detects** `is_readonly` / `is_session_expired` transitions.
 
 | ID | Fault | Expectation to verify |
 |---|---|---|
-| C1 | `SIGKILL` one CH replica under steady ingest | Writes continue iff `insert_quorum<2`; measure catch-up rate on restart; **zero data loss** |
+| C1 | `SIGKILL` one CH replica under steady ingest | Writes continue iff `insert_quorum<2`; catch-up rate on restart; **zero data loss** |
 | C2 | Graceful restart of one replica | Clean drain and rejoin; startup time with realistic part count |
 | C3 | Kill 1 of 3 Keeper nodes | No write impact; measure the latency blip |
-| C4 | Kill 2 of 3 Keeper nodes | **Quorum lost → tables go read-only.** Measure detection and recovery time |
-| C5 | Kill the Keeper leader | Re-election time and its impact on the insert path |
+| C4 | Kill 2 of 3 Keeper nodes | **Quorum lost → tables read-only.** Detection and recovery time |
+| C5 | Kill the Keeper leader | Re-election time and impact on the insert path |
 | C6 | `tc netem` 50 ms replica↔replica and →Keeper | Replication lag growth and recovery |
-| C7 | Fill disk to 95% | Merge failures, insert rejection, behaviour at the watermark |
+| C7 | Fill disk to 95% | Merge failures before insert rejection — the D7 failure order |
 | C8 | `stress-ng` CPU starvation on one replica | Query routing and degradation profile |
-| C9 | Long `ALTER UPDATE` mutation during peak ingest | Mutation vs merge contention (D13) |
-| C10 | Restart a replica holding a very high part count | Startup/attach time — often minutes, and often a surprise |
+| C9 | Mutation without a `site` predicate during peak | 30-partition rewrite vs merges (D13) |
+| C10 | Restart a replica holding ~40,000 parts | Startup/attach time — often minutes |
+| **C11** | **Redeliver an L2 trigger, then redeliver concurrently** | **L2 row counts unchanged (D18)** |
+| **C12** | **Replay a completed job** | **L2 reflects only the latest replay version (D11/D18)** |
 
 ### 2.9 Scenario suite to ship
 
@@ -704,103 +1161,154 @@ The harness ships a playbook with exact commands, expected outcome, and pass cri
 | T1 | `smoke` — tiny load, all paths | 5 min | sanity, CI gate |
 | T2 | `insert-baseline-{stream}` per value stream | 30 min | D1, D3 |
 | T3 | `query-baseline-cold` / `-warm` | 30 min | D2, D15 |
-| T4 | `mixed-eod-peak` — all 4 streams + L2 reports | 1 h | D5, D6, D8 |
-| T5 | `pipeline-freshness` — L0→L1→L2 end-to-end latency | 1 h | D8 |
+| T4 | `mixed-eod-peak` — all 5 streams, staggered sites + L2 builds | 1 h | D5, D6, D8 |
+| T5 | `pipeline-freshness` — job completion → L2 readable | 1 h | D8, D18 |
 | T6 | `breaking-point` — ramp to SLO breach | 2 h | D12 |
-| T7 | `soak-24h` / `soak-7d` | 24 h / 7 d | D10, D3, D17 |
-| T8 | `chaos-*` — one per C1–C10 | 30–60 min | D9 |
+| T7 | `soak-24h` / `soak-7d` | 24 h / 7 d | D10, D3, D4, D17 |
+| T8 | `chaos-*` — one per C1–C12 | 30–60 min | D9, D18 |
 | T9 | `maintenance-under-load` | 1 h | D13 |
 | T10 | `capacity-growth` — measure bytes/row, project retention | 2 h | D7 |
+| **T11** | **`multi-date-replay` — 5 cob_dates × 10 sites** | **1 h** | **D3 partition fan-out** |
+| **T12** | **`trigger-redelivery` — duplicate and concurrent triggers** | **30 min** | **D18, D11** |
 
 ---
 
 ## Part 3 — Build plan
 
-### 3.1 Module layout
+**Deferred.** Module layout, dependencies and delivery phases are unchanged in shape from the
+previous revision but need re-sequencing around `JobDriver`, `L2BuildDriver` and job-level
+reconciliation. They will be re-planned once the open items below are closed — building a generator
+against unmeasured fan-out and job-size distributions would bake in exactly the placeholder
+arithmetic this document warns about.
 
-```
-riskstore-perfbench/
-  pom.xml                              Java 21, maven-shade fat JAR
-  src/main/java/com/riskstore/perf/
-    Main.java                          config load → Muserver boot
-    api/                               RunsResource, ScenariosResource, PreflightResource,
-                                       MarksResource, ReportResource, HealthResource
-    config/                            HarnessConfig, ClusterConfig, SafetyGuard (Jackson-YAML)
-    scenario/                          Scenario, Workload, Phase, SloSpec, ScenarioLoader, ScenarioValidator
-    engine/                            RunCoordinator, RunContext, PhaseScheduler,
-                                       ArrivalScheduler   ← open-loop, virtual clock
-                                       InsertDriver, InsertSelectDriver, QueryDriver
-    gen/                               Generator SPI, FieldSpec (cardinality/distribution),
-                                       RatesAtlasGenerator, TradeGenerator, MarketDataGenerator, SeededRandom
-    ch/                                ClickHouseClientFactory (client-v2), InsertSink,
-                                       QueryExecutor, QueryIdFactory, CacheController
-    metrics/                           LatencyRecorder (HdrHistogram), WindowedHistogramStore,
-                                       ErrorCounter, SystemTableScraper, ZookeeperInfoScraper,
-                                       QueryLogHarvester, PartLogHarvester, OsMetricsScraper
-    verify/                            Reconciler, SloEvaluator, BaselineComparator
-    results/                           ResultsWriter, ResultsSchemaBootstrap, RunRepository
-    report/                            SummaryBuilder, HtmlReportRenderer, JsonReportRenderer,
-                                       MarkdownRenderer, InlineSvgChart
-  src/main/resources/
-    scenarios/*.yaml
-    sql/results-schema.sql
-    sql/sut-metrics/*.sql
-    sql/workloads/*.sql                query + transform library
-    report/template.html, report.css
-  src/test/java/...
-  docs/CHAOS-PLAYBOOK.md
-```
-
-### 3.2 Dependencies (verified current)
-
-| Dependency | Coordinate | Note |
-|---|---|---|
-| HTTP server | `io.muserver:mu-server:2.2.2` | `MuServerBuilder` + `RestHandlerBuilder`; Java 17+ |
-| ClickHouse client | `com.clickhouse:client-v2:0.9.4` | v2 client — RowBinary/Native, lighter than JDBC |
-| Latency | `org.hdrhistogram:HdrHistogram` | Lossless merge is why percentiles are trustworthy |
-| YAML/JSON | `com.fasterxml.jackson.dataformat:jackson-dataformat-yaml` + `jackson-databind` | |
-| Logging | `org.slf4j:slf4j-api` + `ch.qos.logback:logback-classic` | |
-| Test | JUnit 5, AssertJ, Testcontainers (ClickHouse) | |
-
-Java 21 **virtual threads** are the right fit for the open-loop driver: thousands of in-flight arrivals without pinning platform threads, so a stalled server doesn't throttle the arrival schedule.
-
-### 3.3 Delivery phases
-
-| Phase | Scope | Exit criteria |
-|---|---|---|
-| **P0 — Skeleton** | pom, `Main`, Muserver boot, config load, `/health`, `/preflight`, safety allowlist | `curl /api/v1/health` returns 200; preflight reports real cluster state |
-| **P1 — Core engine** | Scenario model + loader, `ArrivalScheduler` (open-loop), `RunCoordinator`, `LatencyRecorder`, in-memory results | `smoke` scenario runs, prints p50/p99 |
-| **P2 — Insert path** | `RatesAtlasGenerator`, `InsertSink` (JSONEachRow + RowBinary), dedup tokens, batching, `QueryIdFactory` | `insert-baseline-rates` runs end-to-end ← *scaffolding milestone (insert)* |
-| **P3 — Query path** | SQL workload library, `QueryDriver`, weighted selection, `CacheController` (cold/warm) | `query-baseline-cold` runs end-to-end ← *scaffolding milestone (query)* |
-| **P4 — SUT collectors** | `SystemTableScraper`, `ZookeeperInfoScraper`, query/part log harvesters, `SYSTEM FLUSH LOGS` | Full metric catalogue captured and joined by `query_id` |
-| **P5 — Results + report** | `perf_results` schema bootstrap, `ResultsWriter`, JSON + self-contained HTML + Markdown | Report renders offline with inline SVG charts |
-| **P6 — Verify + gate** | `Reconciler`, `SloEvaluator`, `BaselineComparator` | Scorecard PASS/FAIL; non-zero exit on regression for CI |
-| **P7 — Scenario suite + chaos** | T2–T10 scenarios, `/marks`, auto-detection, `CHAOS-PLAYBOOK.md` | All chaos scenarios documented and scoreable |
-
-**P0–P3 is the "working scaffolding" deliverable.** P4–P7 is the full harness.
-
-### 3.4 Verification
-
-1. **Local, no cluster needed** — Testcontainers single-node ClickHouse; run `smoke`; assert a report is produced and SLO evaluation fires on both pass and fail.
-2. **Open-loop correctness** — unit-test `ArrivalScheduler` against an injected stalling sink: verify recorded latency reflects *intended* send time (i.e. the stall shows up). This is the test that proves you don't have coordinated omission.
-3. **Histogram merge correctness** — merge known windowed HdrHistograms, assert the global p99.9 matches a brute-force computation over the raw sample set.
-4. **Correlation** — run an insert + query scenario, assert every client-side op has a matching `system.query_log` row by `query_id`.
-5. **On the real cluster** — run `preflight`, then `insert-baseline-rates`, then `query-baseline-cold`; sanity-check throughput and part counts against manual `clickhouse-client` observation.
-6. **Reconciliation** — deliberately kill an insert mid-batch, restart, confirm the Reconciler reports the right expected/actual and that dedup tokens prevented duplicates.
-7. **Report** — open the HTML with the network disabled; confirm it renders fully.
+Dependencies remain: `io.muserver:mu-server:2.2.2`, `com.clickhouse:client-v2:0.9.4`,
+`org.hdrhistogram:HdrHistogram`, Jackson YAML/databind, SLF4J + Logback, JUnit 5 / AssertJ /
+Testcontainers. Java 21 virtual threads remain the right fit for the open-loop driver.
 
 ---
 
-## Open items to confirm during build
+## Open items
 
-These need your real numbers and don't block starting — but the SLO thresholds in §2.4 are **placeholders** until they're settled:
+### Measurement queries — run these first
 
-- Target ingest rates per value stream (rows/sec and bytes/sec, peak and EOD-burst).
-- L2 report query latency SLOs and concurrency (how many reports fire simultaneously post-trigger).
-- Freshness SLO: Kafka publish → L2 readable.
-- Retention policy per layer — drives the D7 capacity projection against the 6 TB ceiling.
-- `insert_quorum` decision: with only 2 replicas, `insert_quorum=2` means one replica outage stops all writes. Durability vs availability — test both.
-- Whether 26.1 workload scheduling (`CREATE WORKLOAD`/`CREATE RESOURCE`) will be used for value-stream isolation, so D5 can be tested with and without it.
+**Query 1 — bytes/row, compression, and part distribution.** Unblocks D7, D10 and D12; needs no
+live traffic.
+
+```sql
+SELECT
+    table,
+    uniqExact(partition)                                                AS partitions,
+    count()                                                             AS parts,
+    round(count() / uniqExact(partition), 1)                            AS parts_per_partition,
+    sum(rows)                                                           AS rows,
+    formatReadableSize(sum(data_compressed_bytes))                      AS on_disk,
+    round(sum(data_compressed_bytes) / sum(rows), 1)                    AS bytes_per_row,
+    round(sum(data_uncompressed_bytes) / sum(data_compressed_bytes), 2) AS compression_ratio
+FROM system.parts
+WHERE active AND database = currentDatabase()
+GROUP BY table
+HAVING sum(rows) > 0
+ORDER BY sum(data_compressed_bytes) DESC;
+```
+
+**Query 2 — fan-out distribution.** Unblocks D3, D6 and D8. First find the column in
+`l1_rates_sensitivity` identifying its source `l0_rates_atlas` row:
+
+```sql
+SELECT table, name, type
+FROM system.columns
+WHERE database = currentDatabase()
+  AND table IN ('l0_rates_atlas', 'l1_rates_sensitivity')
+ORDER BY table, position;
+```
+
+Then, substituting that column, group within L1 — each group is one source row:
+
+```sql
+SELECT
+    count()                          AS source_rows,
+    round(avg(fanout), 1)            AS mean,
+    quantileExact(0.50)(fanout)      AS p50,
+    quantileExact(0.95)(fanout)      AS p95,
+    quantileExact(0.99)(fanout)      AS p99,
+    max(fanout)                      AS max
+FROM (
+    SELECT <source_row_key>, count() AS fanout
+    FROM l1_rates_sensitivity
+    WHERE cob_date = '2026-09-15'
+    GROUP BY <source_row_key>
+);
+```
+
+To find what drives the spread, add the instrument/product column:
+
+```sql
+SELECT
+    instrument,
+    count()                     AS source_rows,
+    round(avg(fanout), 1)       AS mean_fanout,
+    quantileExact(0.95)(fanout) AS p95_fanout,
+    max(fanout)                 AS max_fanout
+FROM (
+    SELECT <instrument_col> AS instrument, <source_row_key>, count() AS fanout
+    FROM l1_rates_sensitivity
+    WHERE cob_date = '2026-09-15'
+    GROUP BY instrument, <source_row_key>
+)
+GROUP BY instrument
+ORDER BY mean_fanout DESC;
+```
+
+**Query 3 — messages per job across every L0 table.** Unblocks every rate in this document.
+
+```sql
+SELECT
+    table,
+    count()                             AS jobs,
+    quantileExact(0.50)(rows_per_job)   AS p50,
+    quantileExact(0.95)(rows_per_job)   AS p95,
+    max(rows_per_job)                   AS max
+FROM (
+    SELECT _table AS table, job_id, count() AS rows_per_job
+    FROM merge(currentDatabase(), '^l0_.*')
+    WHERE cob_date = '2026-09-15'
+    GROUP BY table, job_id
+)
+GROUP BY table
+ORDER BY p95 DESC;
+```
+
+`merge()` requires `job_id` and `cob_date` in every matched table — tighten the regex if one lacks
+them.
+
+### Decisions pending
+
+| Item | Recommendation | Blocks |
+|---|---|---|
+| **TTL** | 1 month (~22 business dates) | D7, D4, D14, D15 |
+| **Partition key** | Keep `(cob_date, site)` | D3, D7, D13 |
+| `insert_quorum` | Test both; decide from a measured run | D4, D9 |
+| Workload scheduling (26.1) | Test D5 with and without | D5 |
+
+### Questions still open
+
+- **Does the L2 build filter to the latest replay version?** If not, replayed jobs double-count into
+  L2 with no error. *(D11, D18)*
+- **Is the L2 build idempotent under trigger redelivery?** Kafka is at-least-once. *(D18)*
+- **Is every L2 build scoped to a single `(cob_date, site)` partition?** Determines whether D6's
+  join memory is 40 MB or 22× that. *(D6)*
+- **How many L2 tables does one upstream job actually write?** The "~10" estimate cannot hold
+  against 12 L2 data tables total, and `fx_cash`/`fx_options` have none. *(D8)*
+- **Is `l2_loh_rates_mtmoverride` genuinely site-specific?** If some L2 tables are per-site, the
+  table count grows with onboarding. *(D4, D7)*
+- **Is L0+L1 two inserts or one atomic operation?** Determines the size of the window where L0
+  exists without L1, and what replay must re-derive. *(D11)*
+- **What is the ingestion-service batch size?** The D4 Keeper tripwire depends on it. *(D4)*
+- **What is the peak-to-average ingest ratio?** Everything in D12 scales with it. *(D12)*
+- **Target L2 report query latency SLOs and concurrency** — how many reports fire after a
+  regional close. *(D5, D18)*
+- **Freshness SLO** — Kafka publish → L2 readable, now understood to be bounded by job size.
+  *(D8)*
 
 ---
 
