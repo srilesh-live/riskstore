@@ -1,0 +1,29 @@
+# Build output
+target/
+*.class
+*.jar
+
+# Runtime output
+logs/
+results/
+
+# Source repositories cloned in for feature extraction. These are independent
+# repos with their own remotes; tracking them here would either embed broken
+# gitlinks or duplicate their contents into this one.
+riskstore-ingestion-service/
+riskstore-data-lineage/
+riskstore-rods-query-service/
+riskstore-kafka-manager/
+riskstore-kafka-publisher/
+riskstore-goldeneye-query-service/
+riskstore-marketdata-service/
+riskstore-reference-data-service/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

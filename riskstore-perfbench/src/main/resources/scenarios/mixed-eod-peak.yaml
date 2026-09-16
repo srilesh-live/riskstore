@@ -1,0 +1,102 @@
+# The realistic case: everything at once.
+#
+# Nothing in production runs alone. Value streams ingest, the report service
+# builds L2, and somebody runs an ad-hoc query at the worst possible moment. A
+# p99 measured on an idle cluster is fiction; this scenario is what the SLOs
+# should actually be written against.
+#
+# Worth running twice: once as-is, and once with ClickHouse 26.1 workload
+# scheduling in place (CREATE RESOURCE / CREATE WORKLOAD) to quantify what
+# isolation between value streams is actually worth.
+id: mixed-eod-peak
+description: All streams ingesting while L2 reports build and ad-hoc queries run
+seed: 42
+cachePolicy: none
+
+phases:
+  - { id: warmup, type: hold, rate: 30000, for: PT5M, excludeFromMetrics: true }
+  - { id: ramp,   type: ramp, from: 30000, to: 200000, over: PT10M, excludeFromMetrics: true }
+  - { id: steady, type: hold, rate: 200000, for: PT30M }
+  - { id: spike,  type: hold, rate: 500000, for: PT5M }
+  - { id: settle, type: hold, rate: 200000, for: PT10M }
+
+workloads:
+  - id: l0-rates-atlas
+    kind: insert
+    share: 0.40
+    target: { table: l0_rates_atlas, format: JSONEachRow }
+    batch: { rows: 20000, queueDepth: 4, producers: 2 }
+    generator:
+      ref: rates-atlas-payload
+      params: { trades: "2000000", books: "240", businessDates: "1" }
+    settings: { async_insert: "0", input_format_skip_unknown_fields: "1" }
+
+  - id: l0-rates-trade
+    kind: insert
+    share: 0.15
+    target: { table: l0_rates_trade, format: JSONEachRow }
+    batch: { rows: 20000, queueDepth: 3, producers: 1 }
+    generator:
+      ref: trade-payload
+      params: { trades: "2000000", books: "240", valueStream: "rates" }
+    settings: { async_insert: "0", input_format_skip_unknown_fields: "1" }
+
+  - id: l0-rates-market-data
+    kind: insert
+    share: 0.45
+    target: { table: l0_rates_market_data, format: JSONEachRow }
+    batch: { rows: 50000, queueDepth: 3, producers: 2 }
+    generator:
+      ref: market-data-payload
+      params: { snaps: "24" }
+    settings: { async_insert: "0", input_format_skip_unknown_fields: "1" }
+
+  - id: l1-transform-valuation
+    kind: insertSelect
+    sqlRef: t_l0_to_l1_rates_valuation
+    triggerEvery: PT1M
+    settings: { max_threads: "16" }
+
+  # The expensive half of the transform: one L0 row becomes fourteen L1 rows.
+  - id: l1-transform-sensitivity
+    kind: insertSelect
+    sqlRef: t_l0_to_l1_rates_sensitivity
+    triggerEvery: PT2M
+    settings: { max_threads: "16" }
+
+  - id: l2-report-build
+    kind: insertSelect
+    sqlRef: t_l1_to_l2_pnl_explain
+    triggerEvery: PT5M
+    settings:
+      # grace_hash spills to disk rather than dying at the memory limit, which
+      # is the behaviour you want under peak. Compare against hash to see what
+      # that safety costs in latency.
+      join_algorithm: "grace_hash"
+      max_bytes_before_external_group_by: "20000000000"
+
+  - id: adhoc-queries
+    kind: query
+    arrivalRate: { unit: qps, value: 3 }
+    queries:
+      - { ref: q_pnl_explain_by_book,  weight: 0.4 }
+      - { ref: q_sensitivity_ladder,   weight: 0.3 }
+      - { ref: q_book_aggregate_wide,  weight: 0.3 }
+
+slo:
+  - { metric: "insert.l0-rates-atlas.p99", op: lte, value: "PT3S" }
+  - { metric: "insert.l0-rates-market-data.p99", op: lte, value: "PT3S" }
+  - { metric: "query.adhoc-queries.p95", op: lte, value: "PT10S" }
+  - { metric: "sut.MaxPartCountForPartition.max", op: lte, value: "250" }
+  - { metric: "sut.ReplicationAbsoluteDelay.p99", op: lte, value: "60" }
+  - { metric: "sut.KeeperAvgLatencyMs.p99", op: lte, value: "50" }
+  # Any delayed insert at all means merges are already losing to ingestion.
+  - { metric: "sut.DelayedInserts.max", op: lte, value: "0" }
+  - { metric: "errors.rate", op: lte, value: "0.005" }
+  - { metric: "recon.rowsLost", op: eq, value: "0" }
+
+reconciliation:
+  - name: l0-atlas-rows-persisted
+    sql: "SELECT count() AS value FROM riskstore.l0_rates_atlas WHERE business_date = today()"
+    expect: generated
+    tolerance: 0.5

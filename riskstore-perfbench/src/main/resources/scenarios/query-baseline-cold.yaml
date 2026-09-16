@@ -1,0 +1,40 @@
+# Query characterisation against a quiet cluster with cold caches.
+#
+# Cold is the honest starting point: it is what the first report of the morning
+# actually experiences. Run a warm variant alongside it and quote both - the gap
+# is routinely 10x or more, and reporting only one of them is how benchmark
+# numbers stop matching production.
+#
+# IMPORTANT: SYSTEM DROP ... CACHE clears ClickHouse caches only. For a genuinely
+# cold run the operator must also clear the OS page cache on every replica:
+#   sync && echo 3 > /proc/sys/vm/drop_caches
+id: query-baseline-cold
+description: Report query latency against a quiet cluster with cold caches
+seed: 42
+cachePolicy: cold
+
+phases:
+  - { id: steady, type: hold, rate: 0, for: PT30M }
+
+workloads:
+  - id: l2-reports
+    kind: query
+    arrivalRate: { unit: qps, value: 5 }
+    queries:
+      - { ref: q_pnl_explain_by_book,    weight: 0.30 }
+      - { ref: q_sensitivity_ladder,     weight: 0.25 }
+      - { ref: q_trade_join_valuation,   weight: 0.20 }
+      - { ref: q_valuation_point_lookup, weight: 0.15 }
+      - { ref: q_book_aggregate_wide,    weight: 0.10 }
+    settings:
+      use_query_cache: "0"
+      max_threads: "16"
+
+slo:
+  - { metric: "query.q_pnl_explain_by_book.p95", op: lte, value: "PT3S" }
+  - { metric: "query.q_sensitivity_ladder.p95", op: lte, value: "PT8S" }
+  # Should be near-instant. If this breaches, the primary index is not being
+  # used, and every other query number needs re-reading in that light.
+  - { metric: "query.q_valuation_point_lookup.p95", op: lte, value: "PT0.5S" }
+  - { metric: "query.q_trade_join_valuation.p99", op: lte, value: "PT15S" }
+  - { metric: "errors.rate", op: lte, value: "0.001" }

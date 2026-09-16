@@ -1,0 +1,316 @@
+# ---------------------------------------------------------------------------
+# Server-side metric catalogue for riskstore-perfbench.
+#
+# Every probe MUST return exactly three columns: metric (String), label (String)
+# and value (Float64). The scraper stamps timestamp and node itself. Keeping the
+# contract that narrow means a new system table can be added here, without a
+# rebuild, by anyone who can write SQL.
+#
+# Probes are executed against EVERY replica on each cycle, because the facts that
+# matter most - part counts, replication lag, disk headroom - differ per replica,
+# and an average across two replicas hides the one about to fall over.
+#
+# A probe that fails is logged once and skipped for the rest of the run; it never
+# aborts the cycle. Restrictive grants are common and a single denied SELECT must
+# not cost you the whole diagnostic record.
+#
+# Verified against ClickHouse 26.1.
+# ---------------------------------------------------------------------------
+
+# --- D3: merge and part lifecycle ------------------------------------------
+# MaxPartCountForPartition is the single most important early-warning signal in
+# this whole file. MergeTree delays inserts at parts_to_delay_insert (default
+# 150) and rejects them at parts_to_throw_insert (default 300). Ingestion does
+# not slow gracefully when merges fall behind; it stops.
+async_metrics: |
+  SELECT
+      metric AS metric,
+      '' AS label,
+      toFloat64(value) AS value
+  FROM system.asynchronous_metrics
+  WHERE metric IN (
+      'MaxPartCountForPartition',
+      'TotalPartsOfMergeTreeTables',
+      'NumberOfTables',
+      'LoadAverage1',
+      'LoadAverage15',
+      'OSMemoryAvailable',
+      'OSMemoryTotal',
+      'jemalloc.resident',
+      'jemalloc.allocated',
+      'MarkCacheBytes',
+      'UncompressedCacheBytes',
+      'Uptime'
+  )
+
+parts_summary: |
+  SELECT 'ActiveParts' AS metric, concat(database, '.', table) AS label, toFloat64(count()) AS value
+  FROM system.parts WHERE active AND database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')
+  GROUP BY database, table
+  UNION ALL
+  SELECT 'PartRows', concat(database, '.', table), toFloat64(sum(rows))
+  FROM system.parts WHERE active AND database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')
+  GROUP BY database, table
+  UNION ALL
+  SELECT 'PartBytesOnDisk', concat(database, '.', table), toFloat64(sum(bytes_on_disk))
+  FROM system.parts WHERE active AND database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')
+  GROUP BY database, table
+  UNION ALL
+  -- Compression ratio and bytes-per-row are what turn a throughput number into a
+  -- retention projection against the 6 TB per-replica ceiling.
+  SELECT 'CompressionRatio', concat(database, '.', table),
+         if(sum(data_compressed_bytes) = 0, 0,
+            sum(data_uncompressed_bytes) / sum(data_compressed_bytes))
+  FROM system.parts WHERE active AND database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')
+  GROUP BY database, table
+  UNION ALL
+  SELECT 'BytesPerRow', concat(database, '.', table),
+         if(sum(rows) = 0, 0, sum(bytes_on_disk) / sum(rows))
+  FROM system.parts WHERE active AND database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')
+  GROUP BY database, table
+
+# system.parts.files is new in 26.1. A rising file count per part signals wide or
+# sparse schemas, which drives both merge cost and page-cache pressure.
+parts_files: |
+  SELECT
+      'PartFiles' AS metric,
+      concat(database, '.', table) AS label,
+      toFloat64(sum(files)) AS value
+  FROM system.parts
+  WHERE active AND database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')
+  GROUP BY database, table
+
+merges_summary: |
+  SELECT 'MergesRunning' AS metric, '' AS label, toFloat64(count()) AS value FROM system.merges
+  UNION ALL
+  SELECT 'MergeMaxElapsedSec', '', toFloat64(max(elapsed)) FROM system.merges
+  UNION ALL
+  SELECT 'MergeBytesInProgress', '', toFloat64(sum(total_size_bytes_compressed)) FROM system.merges
+  UNION ALL
+  SELECT 'MergeMemoryBytes', '', toFloat64(sum(memory_usage)) FROM system.merges
+  UNION ALL
+  SELECT 'MergeMinProgress', '', toFloat64(min(progress)) FROM system.merges
+
+# --- D4: replication and Keeper --------------------------------------------
+replicas_summary: |
+  SELECT 'ReplicationAbsoluteDelay' AS metric, concat(database, '.', table) AS label,
+         toFloat64(absolute_delay) AS value FROM system.replicas
+  UNION ALL
+  SELECT 'ReplicationQueueSize', concat(database, '.', table), toFloat64(queue_size) FROM system.replicas
+  UNION ALL
+  SELECT 'ReplicationInsertsInQueue', concat(database, '.', table), toFloat64(inserts_in_queue) FROM system.replicas
+  UNION ALL
+  SELECT 'ReplicationMergesInQueue', concat(database, '.', table), toFloat64(merges_in_queue) FROM system.replicas
+  UNION ALL
+  -- Both of these going to 1 is what a Keeper quorum loss looks like from the
+  -- database side: the table is still there, it just cannot be written to.
+  SELECT 'ReplicaIsReadOnly', concat(database, '.', table), toFloat64(is_readonly) FROM system.replicas
+  UNION ALL
+  SELECT 'ReplicaSessionExpired', concat(database, '.', table), toFloat64(is_session_expired) FROM system.replicas
+  UNION ALL
+  SELECT 'ReplicaActiveCount', concat(database, '.', table), toFloat64(active_replicas) FROM system.replicas
+  UNION ALL
+  SELECT 'ReplicaTotalCount', concat(database, '.', table), toFloat64(total_replicas) FROM system.replicas
+
+# system.zookeeper_info is new in 26.1 and is the best view of Keeper this
+# architecture has ever had from SQL. With only three Keeper nodes, Keeper is the
+# hard write ceiling long before CPU is: every insert block creates znodes, so
+# znode_count and outstanding_requests climb with ingest rate, and avg_latency is
+# what actually caps it.
+#
+# KeeperCommitLag is derived rather than raw: the gap between what the leader has
+# committed and what this node has committed is the clearest single number for a
+# follower falling behind.
+keeper_info: |
+  SELECT 'KeeperAvgLatencyMs' AS metric, host AS label, toFloat64(avg_latency) AS value FROM system.zookeeper_info
+  UNION ALL
+  SELECT 'KeeperMaxLatencyMs', host, toFloat64(max_latency) FROM system.zookeeper_info
+  UNION ALL
+  SELECT 'KeeperOutstandingRequests', host, toFloat64(outstanding_requests) FROM system.zookeeper_info
+  UNION ALL
+  SELECT 'KeeperZnodeCount', host, toFloat64(znode_count) FROM system.zookeeper_info
+  UNION ALL
+  SELECT 'KeeperWatchCount', host, toFloat64(watch_count) FROM system.zookeeper_info
+  UNION ALL
+  SELECT 'KeeperEphemeralsCount', host, toFloat64(ephemerals_count) FROM system.zookeeper_info
+  UNION ALL
+  SELECT 'KeeperDataSizeBytes', host, toFloat64(approximate_data_size) FROM system.zookeeper_info
+  UNION ALL
+  SELECT 'KeeperIsLeader', host, toFloat64(is_leader) FROM system.zookeeper_info
+  UNION ALL
+  SELECT 'KeeperSyncedFollowers', host, toFloat64(synced_followers) FROM system.zookeeper_info
+  UNION ALL
+  SELECT 'KeeperPendingSyncs', host, toFloat64(pending_syncs) FROM system.zookeeper_info
+  UNION ALL
+  SELECT 'KeeperConnections', host, toFloat64(connections) FROM system.zookeeper_info
+  UNION ALL
+  SELECT 'KeeperIsConnected', host, toFloat64(ifNull(is_connected, 0)) FROM system.zookeeper_info
+  UNION ALL
+  SELECT 'KeeperCommitLag', host,
+         toFloat64(if(leader_committed_log_idx > last_committed_idx,
+                      leader_committed_log_idx - last_committed_idx, 0))
+  FROM system.zookeeper_info
+  UNION ALL
+  -- Keeper log and snapshot growth is a real disk consumer on the Keeper hosts
+  -- and a common cause of a slow, surprising outage weeks after go-live.
+  SELECT 'KeeperLogDirBytes', host, toFloat64(log_dir_size) FROM system.zookeeper_info
+  UNION ALL
+  SELECT 'KeeperSnapshotDirBytes', host, toFloat64(snapshot_dir_size) FROM system.zookeeper_info
+
+# Cumulative counters. Rate of change matters more than absolute value; the
+# report differences them.
+keeper_events: |
+  SELECT
+      concat('Event_', event) AS metric,
+      '' AS label,
+      toFloat64(value) AS value
+  FROM system.events
+  WHERE event IN (
+      'ZooKeeperTransactions',
+      'ZooKeeperCreate',
+      'ZooKeeperRemove',
+      'ZooKeeperMulti',
+      'ZooKeeperGet',
+      'ZooKeeperSet',
+      'ZooKeeperList',
+      'ZooKeeperWaitMicroseconds',
+      'ZooKeeperBytesSent',
+      'ZooKeeperBytesReceived',
+      'ZooKeeperHardwareExceptions',
+      'ZooKeeperUserExceptions',
+      'ZooKeeperOtherExceptions'
+  )
+
+# --- D6, D16: memory, concurrency and connections ---------------------------
+server_metrics: |
+  SELECT
+      metric AS metric,
+      '' AS label,
+      toFloat64(value) AS value
+  FROM system.metrics
+  WHERE metric IN (
+      'Query',
+      'Merge',
+      'PartMutation',
+      'MemoryTracking',
+      'BackgroundMergesAndMutationsPoolTask',
+      'BackgroundFetchesPoolTask',
+      'BackgroundCommonPoolTask',
+      'ReplicatedFetch',
+      'ReplicatedSend',
+      'ReplicatedChecks',
+      'ReadonlyReplica',
+      'DelayedInserts',
+      'DistributedSend',
+      'TCPConnection',
+      'HTTPConnection',
+      'ZooKeeperRequest',
+      'ZooKeeperWatch',
+      'ZooKeeperSession',
+      'GlobalThreadActive',
+      'QueryThread',
+      'OpenFileForRead',
+      'OpenFileForWrite'
+  )
+
+# --- D7: storage capacity ---------------------------------------------------
+# Free space is not just a capacity question. A merge needs free space of the
+# same order as the parts it is merging, so a disk at 90% stops merging long
+# before it stops accepting writes - and then part count climbs and ingestion
+# stops for what looks like an unrelated reason.
+disks: |
+  SELECT 'DiskAvailableBytes' AS metric, name AS label, toFloat64(free_space) AS value FROM system.disks
+  UNION ALL
+  SELECT 'DiskTotalBytes', name, toFloat64(total_space) FROM system.disks
+  UNION ALL
+  SELECT 'DiskFreeFraction', name, if(total_space = 0, 0, toFloat64(free_space) / total_space) FROM system.disks
+
+# --- D13: maintenance operations under load ---------------------------------
+mutations_pending: |
+  SELECT
+      'MutationsPending' AS metric,
+      concat(database, '.', table) AS label,
+      toFloat64(count()) AS value
+  FROM system.mutations
+  WHERE NOT is_done
+  GROUP BY database, table
+
+# --- Errors -----------------------------------------------------------------
+errors_summary: |
+  SELECT
+      concat('Error_', name) AS metric,
+      '' AS label,
+      toFloat64(value) AS value
+  FROM system.errors
+  WHERE value > 0
+
+# ---------------------------------------------------------------------------
+# Probes below are NOT on the scrape cycle. They are harvested once at the end
+# of a run, or run by hand during analysis.
+# ---------------------------------------------------------------------------
+
+# Joins client-side latency to server-side cost via the run's query_id prefix.
+# This is what lets a report say "p99 was 4s, of which 3.6s was server side, in a
+# query that read 900M rows because the primary index was not used".
+# Substitute ${runPrefix} with QueryIdFactory.runPrefix().
+harvest_query_log: |
+  SELECT
+      query_id,
+      type,
+      event_time_microseconds,
+      query_duration_ms,
+      read_rows,
+      read_bytes,
+      written_rows,
+      written_bytes,
+      result_rows,
+      memory_usage,
+      peak_memory_usage,
+      ProfileEvents,
+      exception_code,
+      exception
+  FROM system.query_log
+  WHERE event_date >= today() - 1
+    AND query_id LIKE concat('${runPrefix}', '%')
+    AND type != 'QueryStart'
+  ORDER BY query_duration_ms DESC
+
+# Part-level history: which merges ran, how long they took, how much memory they
+# needed, and which ones failed.
+harvest_part_log: |
+  SELECT
+      event_type,
+      event_time,
+      database,
+      table,
+      part_name,
+      partition_id,
+      rows,
+      size_in_bytes,
+      duration_ms,
+      merge_reason,
+      peak_memory_usage,
+      error
+  FROM system.part_log
+  WHERE event_date >= today() - 1
+    AND database NOT IN ('system')
+  ORDER BY event_time
+
+# 26.1's mergeTreeAnalyzeIndexes shows the exact row ranges left after the
+# primary and data-skipping indexes are applied. Run it against a slow query
+# found in harvest_query_log to tell "the query is expensive" apart from "the
+# index is not being used".
+# Substitute ${query} with the statement under investigation.
+analyze_indexes: |
+  SELECT * FROM mergeTreeAnalyzeIndexes($$${query}$$)
+
+# Observability self-overhead (D17). The system log tables are real MergeTree
+# tables with real write amplification, and at high QPS they are not free.
+system_log_footprint: |
+  SELECT
+      'SystemLogBytes' AS metric,
+      table AS label,
+      toFloat64(sum(bytes_on_disk)) AS value
+  FROM system.parts
+  WHERE active AND database = 'system'
+  GROUP BY table

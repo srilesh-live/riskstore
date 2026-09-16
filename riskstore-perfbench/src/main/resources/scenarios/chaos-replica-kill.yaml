@@ -1,0 +1,65 @@
+# Chaos C1: lose a replica under sustained ingest.
+#
+# The harness does not inject the fault. An operator follows docs/CHAOS-PLAYBOOK.md
+# and posts a mark, which lands on the run timeline and is overlaid on every
+# chart in the report:
+#
+#   curl -XPOST localhost:8080/api/v1/runs/RUN_ID/marks \
+#        -H 'Content-Type: application/json' \
+#        -d '{"kind":"replica-kill","target":"ch-replica-2","note":"SIGKILL at T+15m"}'
+#
+# What this run is really deciding: with only two replicas, insert_quorum=2 means
+# a single replica outage stops ALL writes. That is a durability versus
+# availability trade-off, and it deserves measured evidence rather than a
+# default. Run this scenario twice, once with each setting, and compare.
+#
+# Pass criteria are correctness first: zero rows lost, and both replicas
+# converged once the killed node returns.
+id: chaos-replica-kill
+description: Sustained ingest through a replica loss and recovery (operator-triggered)
+seed: 42
+cachePolicy: none
+
+phases:
+  - { id: warmup,  type: hold, rate: 20000, for: PT5M, excludeFromMetrics: true }
+  - { id: steady,  type: hold, rate: 60000, for: PT10M }
+  - { id: fault,   type: hold, rate: 60000, for: PT15M }
+  - { id: recover, type: hold, rate: 60000, for: PT20M }
+
+workloads:
+  - id: l0-rates-atlas
+    kind: insert
+    share: 1.0
+    target: { table: l0_rates_atlas, format: JSONEachRow }
+    batch: { rows: 20000, queueDepth: 4, producers: 2 }
+    generator:
+      ref: rates-atlas-payload
+      params: { trades: "2000000", books: "240", businessDates: "1" }
+    settings:
+      async_insert: "0"
+      input_format_skip_unknown_fields: "1"
+      # Set to "2" for the quorum variant of this run. With two replicas that
+      # turns any single-replica outage into a total write outage, which is
+      # exactly the behaviour worth measuring before choosing.
+      insert_quorum: "0"
+
+  - id: availability-probe
+    kind: query
+    arrivalRate: { unit: qps, value: 1 }
+    queries:
+      - { ref: q_valuation_point_lookup, weight: 1.0 }
+
+slo:
+  # Correctness is not negotiable during a fault; latency is.
+  - { metric: "recon.rowsLost", op: eq, value: "0" }
+  - { metric: "insert.l0-rates-atlas.p99", op: lte, value: "PT10S" }
+  - { metric: "errors.rate", op: lte, value: "0.02" }
+  # The replica must have caught up by the end of the recovery phase, not merely
+  # have started to.
+  - { metric: "sut.ReplicationAbsoluteDelay.last", op: lte, value: "60" }
+
+reconciliation:
+  - name: l0-rows-survived-fault
+    sql: "SELECT count() AS value FROM riskstore.l0_rates_atlas WHERE business_date = today()"
+    expect: generated
+    tolerance: 0.0

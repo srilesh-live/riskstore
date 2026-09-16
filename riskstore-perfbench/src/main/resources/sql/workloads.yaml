@@ -1,0 +1,235 @@
+# ---------------------------------------------------------------------------
+# Workload SQL library for riskstore-perfbench.
+#
+# Referenced from scenarios by name (queries[].ref, sqlRef). Kept out of Java so
+# a DBA can review and retune without a rebuild; a file of the same name in the
+# scenario directory overrides these entry by entry.
+#
+# These statements are the harness standing in for the risk-report-service. They
+# are deliberately the shapes that hurt: wide aggregations, a large join across
+# the trade and sensitivity tables, and a point lookup that should be almost
+# free if the primary index is doing its job. A benchmark made only of queries
+# that go fast proves nothing.
+#
+# Written against docs/riskstore-test-schema.sql.
+# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# L0 -> L1 transforms (kind: insertSelect)
+# ===========================================================================
+
+# Flattens the top-level pricing scalars. Cheap relative to the sensitivity
+# transform below, and a useful control against it.
+t_l0_to_l1_rates_valuation: |
+  INSERT INTO riskstore.l1_rates_valuation
+      (business_date, snap_id, trade_id, book_id, counterparty_id, instrument_type,
+       currency, valuation_ccy, pv, notional, valuation_model, is_amended, as_of)
+  SELECT
+      business_date,
+      snap_id,
+      trade_id,
+      book_id,
+      counterparty_id,
+      instrument_type,
+      currency,
+      valuation_ccy,
+      pv,
+      notional,
+      valuation_model,
+      is_amended,
+      as_of
+  FROM riskstore.l0_rates_atlas
+  WHERE business_date = today()
+    AND _received_at >= now() - INTERVAL 2 MINUTE
+
+# Explodes the nested delta ladder: one L0 row becomes fourteen L1 rows. This is
+# the expensive half of the transform, and the reason the L1 sensitivity table
+# dominates storage. arrayJoin over a JSON subcolumn is where 26.1's dynamic
+# subcolumn handling is actually exercised.
+t_l0_to_l1_rates_sensitivity: |
+  INSERT INTO riskstore.l1_rates_sensitivity
+      (business_date, snap_id, trade_id, book_id, currency, curve, tenor, delta, gamma, as_of)
+  SELECT
+      business_date,
+      snap_id,
+      trade_id,
+      book_id,
+      currency,
+      rf.curve::String   AS curve,
+      rf.tenor::String   AS tenor,
+      rf.delta::Float64  AS delta,
+      rf.gamma::Float64  AS gamma,
+      as_of
+  FROM riskstore.l0_rates_atlas
+  ARRAY JOIN risk_factors[] AS rf
+  WHERE business_date = today()
+    AND _received_at >= now() - INTERVAL 2 MINUTE
+
+t_l0_to_l1_rates_trade: |
+  INSERT INTO riskstore.l1_rates_trade
+      (business_date, trade_id, book_id, portfolio, trader_id, counterparty_id,
+       status, currency, notional, trade_date, maturity_date, fixed_rate, is_cleared)
+  SELECT
+      business_date, trade_id, book_id, portfolio, trader_id, counterparty_id,
+      status, currency, notional, trade_date, maturity_date, fixed_rate, is_cleared
+  FROM riskstore.l0_rates_trade FINAL
+  WHERE business_date = today()
+
+# ===========================================================================
+# L1 -> L2 report build (kind: insertSelect)
+# ===========================================================================
+
+# The three-way join the risk-report-service performs. Joins are ClickHouse's
+# weakest area and this is where memory pressure (D6) actually shows up, so the
+# join algorithm is left to the scenario's settings rather than pinned here -
+# comparing hash against grace_hash on the same data is one of the more useful
+# experiments this harness supports.
+t_l1_to_l2_pnl_explain: |
+  INSERT INTO riskstore.l2_rates_pnl_explain
+      (business_date, snap_id, book_id, portfolio, currency, instrument_type,
+       trade_count, total_pv, total_notional, total_delta, total_gamma,
+       cleared_pv, uncleared_pv)
+  SELECT
+      v.business_date            AS business_date,
+      v.snap_id                  AS snap_id,
+      v.book_id                  AS book_id,
+      t.portfolio                AS portfolio,
+      v.currency                 AS currency,
+      v.instrument_type          AS instrument_type,
+      count()                    AS trade_count,
+      sum(v.pv)                  AS total_pv,
+      sum(v.notional)            AS total_notional,
+      sum(s.total_delta)         AS total_delta,
+      sum(s.total_gamma)         AS total_gamma,
+      sumIf(v.pv, t.is_cleared)  AS cleared_pv,
+      sumIf(v.pv, NOT t.is_cleared) AS uncleared_pv
+  FROM riskstore.l1_rates_valuation AS v
+  INNER JOIN riskstore.l1_rates_trade AS t
+      ON v.trade_id = t.trade_id AND v.business_date = t.business_date
+  LEFT JOIN (
+      SELECT business_date, trade_id, sum(delta) AS total_delta, sum(gamma) AS total_gamma
+      FROM riskstore.l1_rates_sensitivity
+      WHERE business_date = today()
+      GROUP BY business_date, trade_id
+  ) AS s
+      ON v.trade_id = s.trade_id AND v.business_date = s.business_date
+  WHERE v.business_date = today()
+  GROUP BY business_date, snap_id, book_id, portfolio, currency, instrument_type
+
+# ===========================================================================
+# Report queries (kind: query)
+# ===========================================================================
+
+# The headline downstream report. Wide aggregation over the whole business date.
+q_pnl_explain_by_book: |
+  SELECT
+      book_id,
+      currency,
+      instrument_type,
+      count()          AS trades,
+      sum(pv)          AS total_pv,
+      sum(notional)    AS total_notional,
+      avg(pv)          AS avg_pv,
+      quantile(0.95)(abs(pv)) AS pv_p95
+  FROM riskstore.l1_rates_valuation
+  WHERE business_date = today()
+  GROUP BY book_id, currency, instrument_type
+  ORDER BY abs(total_pv) DESC
+  LIMIT 500
+
+# Risk ladder across tenors: hits the widest L1 table and is normally the
+# slowest thing in the mix.
+q_sensitivity_ladder: |
+  SELECT
+      book_id,
+      currency,
+      tenor,
+      sum(delta) AS total_delta,
+      sum(gamma) AS total_gamma,
+      count()    AS points
+  FROM riskstore.l1_rates_sensitivity
+  WHERE business_date = today()
+  GROUP BY book_id, currency, tenor
+  ORDER BY book_id, currency, tenor
+  LIMIT 5000
+
+# Should be near-instant. If this is slow, the primary index is not being used,
+# and every other number in the run needs re-reading in that light.
+q_valuation_point_lookup: |
+  SELECT trade_id, book_id, pv, notional, as_of
+  FROM riskstore.l1_rates_valuation
+  WHERE business_date = today()
+    AND book_id = 'RATES-0042'
+  ORDER BY as_of DESC
+  LIMIT 100
+
+# Join-heavy: the shape that drives memory pressure and spilling.
+q_trade_join_valuation: |
+  SELECT
+      t.portfolio    AS portfolio,
+      t.status       AS status,
+      v.currency     AS currency,
+      count()        AS trades,
+      sum(v.pv)      AS total_pv,
+      sum(t.notional) AS total_notional
+  FROM riskstore.l1_rates_valuation AS v
+  INNER JOIN riskstore.l1_rates_trade AS t
+      ON v.trade_id = t.trade_id AND v.business_date = t.business_date
+  WHERE v.business_date = today()
+  GROUP BY portfolio, status, currency
+  ORDER BY abs(total_pv) DESC
+  LIMIT 200
+
+# High-cardinality grouping: the pattern an ad-hoc user runs at exactly the
+# wrong moment, and a good test of workload isolation (D5).
+q_book_aggregate_wide: |
+  SELECT
+      counterparty_id,
+      book_id,
+      currency,
+      count()      AS trades,
+      sum(pv)      AS total_pv,
+      max(abs(pv)) AS max_abs_pv
+  FROM riskstore.l1_rates_valuation
+  WHERE business_date = today()
+  GROUP BY counterparty_id, book_id, currency
+  HAVING trades > 5
+  ORDER BY abs(total_pv) DESC
+  LIMIT 1000
+
+# Low-cardinality scan over the market data table, for the storage projection.
+q_market_data_scan: |
+  SELECT
+      curve_id,
+      tenor,
+      avg(rate)  AS avg_rate,
+      min(rate)  AS min_rate,
+      max(rate)  AS max_rate,
+      count()    AS observations
+  FROM riskstore.l0_rates_market_data
+  WHERE business_date = today()
+  GROUP BY curve_id, tenor
+  ORDER BY curve_id, tenor
+
+# Reads the built L2 report, which is what downstream consumers actually do.
+q_l2_report_read: |
+  SELECT
+      book_id, portfolio, currency, instrument_type,
+      trade_count, total_pv, total_delta, cleared_pv, uncleared_pv
+  FROM riskstore.l2_rates_pnl_explain
+  WHERE business_date = today()
+  ORDER BY abs(total_pv) DESC
+  LIMIT 1000
+
+# ===========================================================================
+# Reconciliation queries, referenced from a scenario's reconciliation block.
+# ===========================================================================
+
+r_count_l0_rates_atlas: |
+  SELECT count() AS value FROM riskstore.l0_rates_atlas WHERE business_date = today()
+
+r_distinct_event_ids: |
+  SELECT uniqExact(event_id) AS value FROM riskstore.l0_rates_atlas WHERE business_date = today()
+
+r_l1_valuation_count: |
+  SELECT count() AS value FROM riskstore.l1_rates_valuation WHERE business_date = today()

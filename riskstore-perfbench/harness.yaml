@@ -1,0 +1,91 @@
+# ---------------------------------------------------------------------------
+# riskstore-perfbench configuration.
+#
+# Run on a host SEPARATE from the ClickHouse replicas. Co-locating the load
+# generator with the database means the harness competes for the CPU it is
+# trying to measure, and every resulting number is a blend of the two.
+#
+# ${VAR} and ${VAR:default} expand from the environment, then from system
+# properties. Never put a password in this file - export CH_PASSWORD instead.
+# ---------------------------------------------------------------------------
+
+server:
+  host: 0.0.0.0
+  port: 8080
+
+sut:
+  # Must appear in safety.allowedClusters below. This pair of settings is the
+  # only thing standing between an operator and accidentally load-testing
+  # production, so both are required and neither has a permissive default.
+  clusterName: riskstore_uat
+
+  # One entry per replica. Scrapers poll every endpoint because part counts,
+  # replication lag and disk headroom are per-replica facts; the drivers
+  # round-robin across them so load distribution is a property of the harness
+  # rather than of the client's internal failover.
+  nodes:
+    - http://ch-replica-1.example.internal:8123
+    - http://ch-replica-2.example.internal:8123
+
+  database: riskstore
+  user: perfbench
+  password: ${CH_PASSWORD:}
+
+  # Sized for 64 vCPU replicas. Too low and the harness queues internally,
+  # inflating latency it will then blame on the database.
+  maxConnections: 256
+  connectTimeoutMs: 10000
+  # Generous on purpose: a stalled cluster should show up as a long latency in
+  # the histogram, not as a client-side timeout that hides the stall.
+  socketTimeoutMs: 300000
+  # Leave off for insert benchmarking. Compressing on the client moves CPU cost
+  # onto the load generator and flatters the network path.
+  compressClientRequest: false
+
+results:
+  # A DIFFERENT ClickHouse instance from the one under test. Writing results
+  # into the cluster being benchmarked adds inserts, parts and merges to the
+  # thing being measured, in proportion to how much data the run produced.
+  enabled: false
+  url: http://perf-results.example.internal:8123
+  database: perf_results
+  user: perfbench
+  password: ${RESULTS_PASSWORD:}
+  # Always written, whether or not the database sink is enabled. A results
+  # database that is down must never cost you a soak run that took a day.
+  fallbackDir: ./results
+
+safety:
+  allowedClusters:
+    - riskstore_uat
+    - riskstore_perf
+    - riskstore_local
+  # Must be set true before any run starts. Runs write data and drop caches, so
+  # every run is destructive to the target database.
+  allowDestructive: false
+  # Preflight refuses to start below this much free disk on any replica. Merges
+  # need free space of the same order as the parts being merged, so a run
+  # started with thin headroom fails as a disk problem rather than producing a
+  # performance result.
+  minFreeDiskFraction: 0.25
+
+paths:
+  # Scenario YAML here overrides the bundled copies by id, and workloads.yaml or
+  # sut-metrics.yaml here override the bundled SQL entry by entry - so a site can
+  # retune without forking the build.
+  scenarioDir: ./scenarios
+  reportDir: ./reports
+
+collectors:
+  # Server-side scrape cadence. 2s is negligible against a saturated cluster but
+  # is not free, and the report says so.
+  sutScrapeIntervalMs: 2000
+  # Latency histogram window. 10s gives usable chart resolution over a 30-minute
+  # run without producing thousands of windows over a 7-day soak.
+  latencyWindowMs: 10000
+  # In-flight cap per workload. Arrivals beyond this are shed and counted rather
+  # than queued, because blocking the pacer would silently reintroduce
+  # coordinated omission. A run with non-zero drops is reported as untrustworthy.
+  maxInFlightPerWorkload: 2048
+  harvestQueryLog: true
+  harvestPartLog: true

@@ -1,0 +1,59 @@
+# Capacity discovery: ramp until something gives.
+#
+# "Does it pass at expected load?" is the wrong question, because it says nothing
+# about how much room is left. This ramps continuously to well beyond expected
+# peak and lets the SLOs record where the knee is.
+#
+# Expect this run to FAIL. That is the point. Read the report for which SLO
+# breached first and at roughly what rate, then divide by your expected peak to
+# get a headroom factor.
+id: breaking-point
+description: Ramp to SLO breach to find the knee and derive a headroom factor
+seed: 42
+cachePolicy: none
+
+phases:
+  - { id: warmup, type: hold, rate: 20000, for: PT5M, excludeFromMetrics: true }
+  - { id: ramp,   type: ramp, from: 20000, to: 1000000, over: PT90M }
+  - { id: hold,   type: hold, rate: 1000000, for: PT15M }
+
+workloads:
+  - id: l0-rates-atlas
+    kind: insert
+    share: 0.6
+    target: { table: l0_rates_atlas, format: JSONEachRow }
+    batch: { rows: 20000, queueDepth: 6, producers: 4 }
+    generator:
+      ref: rates-atlas-payload
+      params: { trades: "2000000", books: "240", businessDates: "1" }
+    settings: { async_insert: "0", input_format_skip_unknown_fields: "1" }
+
+  - id: l0-rates-market-data
+    kind: insert
+    share: 0.4
+    target: { table: l0_rates_market_data, format: JSONEachRow }
+    batch: { rows: 50000, queueDepth: 4, producers: 3 }
+    generator:
+      ref: market-data-payload
+      params: { snaps: "24" }
+    settings: { async_insert: "0", input_format_skip_unknown_fields: "1" }
+
+  - id: probe-queries
+    kind: query
+    arrivalRate: { unit: qps, value: 1 }
+    queries:
+      - { ref: q_valuation_point_lookup, weight: 1.0 }
+
+slo:
+  - { metric: "insert.l0-rates-atlas.p99", op: lte, value: "PT2S" }
+  # The point lookup is the canary. When a query that should take milliseconds
+  # starts taking seconds, the cluster is saturated regardless of what the
+  # ingest numbers still claim.
+  - { metric: "query.probe-queries.p99", op: lte, value: "PT1S" }
+  - { metric: "sut.MaxPartCountForPartition.max", op: lte, value: "300" }
+  - { metric: "sut.DelayedInserts.max", op: lte, value: "0" }
+  - { metric: "errors.rate", op: lte, value: "0.001" }
+  # If the harness sheds load before the database breaks, the run found the
+  # load generator's ceiling instead of the cluster's, and must be rerun with
+  # more headroom on the generator host.
+  - { metric: "harness.overloadDrops", op: eq, value: "0" }

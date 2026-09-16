@@ -1,0 +1,74 @@
+# Endurance. The scenario that finds what every short run misses.
+#
+# Twenty-four hours at a moderate, entirely sustainable rate. Nothing here should
+# be difficult, which is what makes a failure interesting. What this catches:
+#
+#   * part count drifting up rather than holding flat, meaning merges are losing
+#     slowly enough that a thirty-minute run cannot see it
+#   * memory creeping in a way that ends in an OOM three days after go-live
+#   * system log tables growing without bound (observability self-overhead)
+#   * replication lag ratcheting instead of returning to zero
+#
+# Read the trend lines, not the percentiles. A flat p99 with a rising part count
+# is still a failed soak.
+id: soak-24h
+description: Twenty-four hour endurance run at sustainable load, watching for drift
+seed: 42
+cachePolicy: none
+
+phases:
+  - { id: warmup, type: hold, rate: 20000, for: PT10M, excludeFromMetrics: true }
+  - { id: steady, type: hold, rate: 60000, for: PT24H }
+
+workloads:
+  - id: l0-rates-atlas
+    kind: insert
+    share: 0.5
+    target: { table: l0_rates_atlas, format: JSONEachRow }
+    batch: { rows: 20000, queueDepth: 3, producers: 2 }
+    generator:
+      ref: rates-atlas-payload
+      # Several business dates on purpose: late-arriving data spreads writes
+      # across partitions, which is one of the most common real causes of a
+      # part-count blowup that only becomes visible over days.
+      params: { trades: "2000000", books: "240", businessDates: "5" }
+    settings: { async_insert: "0", input_format_skip_unknown_fields: "1" }
+
+  - id: l0-rates-market-data
+    kind: insert
+    share: 0.5
+    target: { table: l0_rates_market_data, format: JSONEachRow }
+    batch: { rows: 50000, queueDepth: 3, producers: 2 }
+    generator:
+      ref: market-data-payload
+      params: { snaps: "24" }
+    settings: { async_insert: "0", input_format_skip_unknown_fields: "1" }
+
+  - id: l1-transform-valuation
+    kind: insertSelect
+    sqlRef: t_l0_to_l1_rates_valuation
+    triggerEvery: PT5M
+
+  - id: steady-reports
+    kind: query
+    arrivalRate: { unit: qps, value: 2 }
+    queries:
+      - { ref: q_pnl_explain_by_book, weight: 0.5 }
+      - { ref: q_sensitivity_ladder,  weight: 0.5 }
+
+slo:
+  - { metric: "insert.l0-rates-atlas.p99", op: lte, value: "PT2S" }
+  - { metric: "query.steady-reports.p95", op: lte, value: "PT5S" }
+  # Over 24h at a sustainable rate this should stay flat. If it does not, merges
+  # are losing and the only open question is how long until ingestion stops.
+  - { metric: "sut.MaxPartCountForPartition.max", op: lte, value: "150" }
+  - { metric: "sut.ReplicationAbsoluteDelay.max", op: lte, value: "120" }
+  - { metric: "sut.DiskFreeFraction.min", op: gte, value: "0.20" }
+  - { metric: "errors.rate", op: lte, value: "0.0001" }
+  - { metric: "recon.rowsLost", op: eq, value: "0" }
+
+reconciliation:
+  - name: l0-rows-persisted
+    sql: "SELECT count() AS value FROM riskstore.l0_rates_atlas"
+    expect: generated
+    tolerance: 0.02

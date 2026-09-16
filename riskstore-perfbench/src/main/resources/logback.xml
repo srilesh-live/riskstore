@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Console plus a rolling file. A soak run lasts a day or more, so the harness log
+  is a genuine forensic record and must survive the terminal session that started
+  it.
+
+  The ClickHouse client and Apache HTTP core are pinned to WARN on purpose: at
+  six-figure operation rates their INFO output is itself a measurable load on the
+  load generator.
+-->
+<configuration>
+
+  <property name="LOG_DIR" value="${LOG_DIR:-./logs}"/>
+  <property name="PATTERN" value="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"/>
+
+  <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>${PATTERN}</pattern>
+    </encoder>
+  </appender>
+
+  <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <file>${LOG_DIR}/perfbench.log</file>
+    <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+      <fileNamePattern>${LOG_DIR}/perfbench.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+      <maxFileSize>100MB</maxFileSize>
+      <maxHistory>30</maxHistory>
+      <totalSizeCap>5GB</totalSizeCap>
+    </rollingPolicy>
+    <encoder>
+      <pattern>${PATTERN}</pattern>
+    </encoder>
+  </appender>
+
+  <logger name="com.riskstore.perf" level="INFO"/>
+
+  <logger name="com.clickhouse" level="WARN"/>
+  <logger name="org.apache.hc" level="WARN"/>
+  <logger name="io.muserver" level="WARN"/>
+
+  <root level="INFO">
+    <appender-ref ref="CONSOLE"/>
+    <appender-ref ref="FILE"/>
+  </root>
+
+</configuration>

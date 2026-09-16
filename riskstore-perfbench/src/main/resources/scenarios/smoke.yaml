@@ -1,0 +1,43 @@
+# Tiny end-to-end check across every code path. Run this first after any change
+# to config, schema or the harness itself: it fails in five minutes rather than
+# ninety, and a failure here is almost always environmental.
+#
+# Do not quote numbers from a smoke run. The load is far too small to say
+# anything about capacity.
+id: smoke
+description: Five-minute sanity check across insert, transform and query paths
+seed: 42
+cachePolicy: none
+
+phases:
+  - { id: steady, type: hold, rate: 2000, for: PT5M }
+
+workloads:
+  - id: l0-rates-atlas
+    kind: insert
+    share: 1.0
+    target: { table: l0_rates_atlas, format: JSONEachRow }
+    batch: { rows: 2000, queueDepth: 4, producers: 1 }
+    generator:
+      ref: rates-atlas-payload
+      params: { trades: "50000", books: "24", businessDates: "1" }
+    settings:
+      async_insert: "0"
+      input_format_skip_unknown_fields: "1"
+
+  - id: l2-report
+    kind: query
+    arrivalRate: { unit: qps, value: 0.5 }
+    queries:
+      - { ref: q_pnl_explain_by_book, weight: 1.0 }
+
+slo:
+  - { metric: "errors.rate", op: lte, value: "0.001" }
+  - { metric: "recon.rowsLost", op: eq, value: "0" }
+  - { metric: "harness.overloadDrops", op: eq, value: "0" }
+
+reconciliation:
+  - name: l0-rows-persisted
+    sql: "SELECT count() AS value FROM riskstore.l0_rates_atlas WHERE business_date = today()"
+    expect: generated
+    tolerance: 0.0

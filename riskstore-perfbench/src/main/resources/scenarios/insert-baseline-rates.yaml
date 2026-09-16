@@ -1,0 +1,64 @@
+# Ingest characterisation for one value stream in isolation.
+#
+# The point is not the throughput number on its own - it is the throughput at
+# which MaxPartCountForPartition stops being flat. MergeTree delays inserts at
+# 150 parts per partition and rejects them at 300, and thirty minutes is long
+# enough for merges to fall behind if they are going to.
+#
+# Run this per value stream before running mixed-eod-peak, or you will not know
+# which stream to blame when the mixed run struggles.
+id: insert-baseline-rates
+description: Rates L0 ingest characterisation, isolated, with merge and part tracking
+seed: 42
+cachePolicy: none
+
+phases:
+  - { id: warmup, type: hold, rate: 20000, for: PT5M, excludeFromMetrics: true }
+  - { id: ramp,   type: ramp, from: 20000, to: 120000, over: PT5M, excludeFromMetrics: true }
+  - { id: steady, type: hold, rate: 120000, for: PT30M }
+
+workloads:
+  - id: l0-rates-atlas
+    kind: insert
+    share: 1.0
+    target: { table: l0_rates_atlas, format: JSONEachRow }
+    batch: { rows: 20000, queueDepth: 4, producers: 3 }
+    generator:
+      ref: rates-atlas-payload
+      params:
+        trades: "2000000"
+        books: "240"
+        counterparties: "5000"
+        businessDates: "1"
+        snapId: "EOD"
+    settings:
+      # Synchronous inserts on purpose. async_insert would measure how fast the
+      # harness can hand work to a buffer, not how fast the cluster can absorb
+      # it. Compare against an async_insert variant as a separate run - that
+      # comparison is one of the more consequential tuning decisions for the
+      # ingestion service.
+      async_insert: "0"
+      input_format_skip_unknown_fields: "1"
+
+slo:
+  - { metric: "insert.l0-rates-atlas.p99", op: lte, value: "PT2S" }
+  - { metric: "insert.l0-rates-atlas.p999", op: lte, value: "PT10S" }
+  - { metric: "throughput.l0-rates-atlas.rowsPerSec", op: gte, value: "100000" }
+  # The part-count ceiling. 300 is where inserts are rejected outright and 150
+  # where they start being delayed, so failing at 200 leaves room to react.
+  - { metric: "sut.MaxPartCountForPartition.max", op: lte, value: "200" }
+  - { metric: "sut.ReplicationAbsoluteDelay.p99", op: lte, value: "30" }
+  - { metric: "errors.rate", op: lte, value: "0.001" }
+  - { metric: "recon.rowsLost", op: eq, value: "0" }
+  - { metric: "harness.overloadDrops", op: eq, value: "0" }
+  - { metric: "harness.batchStarvations", op: eq, value: "0" }
+
+reconciliation:
+  - name: l0-rows-persisted
+    sql: "SELECT count() AS value FROM riskstore.l0_rates_atlas WHERE business_date = today()"
+    expect: generated
+    tolerance: 0.0
+  - name: no-duplicate-events
+    sql: "SELECT uniqExact(event_id) AS value FROM riskstore.l0_rates_atlas WHERE business_date = today()"
+    expect: generated
+    tolerance: 0.0
